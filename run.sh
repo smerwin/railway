@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Container entrypoint: runs the poller (auto-restarting if it ever exits)
-# in the background, then execs socat as the foreground HTTP server.
+# Container entrypoint: runs the Discord Gateway bot (auto-restarting if
+# it ever exits, e.g. on reconnect) in the background, then execs socat
+# as the foreground HTTP server.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -10,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 (
   while true; do
-    "$SCRIPT_DIR/bin/poller.sh"
-    echo "run.sh: poller exited, restarting in 3s..." >&2
+    "$SCRIPT_DIR/bin/bot.sh"
+    echo "run.sh: bot exited, restarting in 3s..." >&2
     sleep 3
   done
 ) &

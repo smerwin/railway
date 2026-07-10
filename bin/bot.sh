@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Connects to the real Discord Gateway (a WebSocket) via websocat, instead
+# of REST-polling, and streams MESSAGE_CREATE events to $MESSAGES_FILE as
+# they happen. On start (and after every reconnect) it first does one REST
+# catch-up fetch for anything posted since the last message we saw, so a
+# dropped connection doesn't silently lose messages. See README for the
+# coproc/heartbeat design and why bash needs websocat to speak WebSocket
+# framing at all.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/config.sh"
+
+: "${DISCORD_BOT_TOKEN:?Set DISCORD_BOT_TOKEN}"
+: "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID}"
+
+API="https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages"
+GATEWAY_URL="wss://gateway.discord.gg/?v=10&encoding=json"
+# GUILDS (1<<0) + GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15)
+INTENTS=33281
+SEQ_FILE="$DATA_DIR/gateway_seq"
+
+touch "$MESSAGES_FILE"
+[ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
+
+# jq function mapping one raw Discord message object to the shape the
+# front-end expects. Shared (as inlined text) between the REST catch-up
+# path and the live Gateway dispatch path below.
+read -r -d '' TO_FEED_MESSAGE_DEF <<'JQ'
+def to_feed_message:
+  {
+    id: .id,
+    authorId: .author.id,
+    authorName: (.member.nick // .author.global_name // .author.username // "Unknown"),
+    authorAvatarURL: (
+      if .author.avatar then
+        "https://cdn.discordapp.com/avatars/\(.author.id)/\(.author.avatar).png?size=64"
+      else
+        "https://cdn.discordapp.com/embed/avatars/0.png"
+      end
+    ),
+    content: .content,
+    createdAt: .timestamp,
+    attachments: [.attachments[] | {url: .url, name: .filename, contentType: .content_type}]
+  };
+JQ
+
+# Fetches anything posted after the last message ID we've persisted.
+# Doubles as the initial history backfill on first-ever start (after=0)
+# and as the gap-filler after every Gateway reconnect.
+catch_up() {
+  local after url response count
+  after="$(cat "$STATE_FILE")"
+  if [ "$after" = "0" ]; then
+    url="${API}?limit=50"
+  else
+    url="${API}?after=${after}&limit=100"
+  fi
+
+  response="$(curl -sS --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
+  [ -z "$response" ] && return 0
+
+  if ! echo "$response" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "bot: catch-up REST error: $(echo "$response" | jq -r '.message // "unknown"' 2>/dev/null)" >&2
+    return 0
+  fi
+
+  count="$(echo "$response" | jq 'length')"
+  if [ "$count" != "0" ]; then
+    echo "$response" | jq -c "
+      ${TO_FEED_MESSAGE_DEF}
+      reverse | .[] | select(.author.bot != true) | to_feed_message
+    " >> "$MESSAGES_FILE"
+    after="$(echo "$response" | jq -r '.[0].id')"
+    echo "$after" > "$STATE_FILE"
+  fi
+}
+
+echo "bot: catch-up on channel ${DISCORD_CHANNEL_ID}" >&2
+catch_up
+
+echo "bot: connecting to Discord Gateway" >&2
+echo "null" > "$SEQ_FILE"
+
+coproc GW { exec websocat -B 1000000 "$GATEWAY_URL"; }
+
+cleanup() {
+  [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
+  [ -n "${GW_PID:-}" ] && kill "$GW_PID" 2>/dev/null
+}
+trap cleanup EXIT
+
+if ! IFS= read -r -u "${GW[0]}" hello_line; then
+  echo "bot: no Hello received from Gateway, exiting" >&2
+  exit 1
+fi
+interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
+interval_sec="$(awk "BEGIN { printf \"%.3f\", ${interval_ms}/1000 }")"
+
+identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS" '
+  {op: 2, d: {token: $token, intents: $intents, properties: {os: "linux", browser: "bash-discord-bot", device: "bash-discord-bot"}}}
+')"
+printf '%s\n' "$identify" >&"${GW[1]}"
+
+# Heartbeat loop: runs as a background job writing to the coproc's stdin
+# on a timer. Bash closes a coprocess's file descriptors in forked child
+# processes (a documented bash limitation, not something specific to
+# this script), so ${GW[1]} itself is unusable from a backgrounded job --
+# it has to be explicitly duplicated to a fixed fd *before* backgrounding.
+# The sequence number is read from a file rather than a shared variable,
+# since the heartbeat job is a separate process from the main dispatch
+# loop below.
+exec 70>&"${GW[1]}"
+(
+  while true; do
+    sleep "$interval_sec"
+    seq="$(cat "$SEQ_FILE")"
+    { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null || exit 0
+  done
+) &
+HEARTBEAT_PID=$!
+
+# Main dispatch loop. No session Resume is implemented: on Reconnect (op
+# 7), Invalid Session (op 9), or the socket just closing, this loop exits
+# and run.sh's outer supervisor restarts the whole script -- which reruns
+# catch_up to bridge the gap, then re-Identifies for a fresh session.
+while IFS= read -r -u "${GW[0]}" line; do
+  op="$(echo "$line" | jq -r '.op')"
+  seq="$(echo "$line" | jq -r '.s // empty')"
+  [ -n "$seq" ] && echo "$seq" > "$SEQ_FILE"
+
+  case "$op" in
+    0)
+      t="$(echo "$line" | jq -r '.t')"
+      if [ "$t" = "MESSAGE_CREATE" ]; then
+        # Intents subscribe to every channel in every guild the bot can
+        # see, not just ours -- Discord has no per-channel Gateway
+        # subscription, so the channel filter has to happen here.
+        channel_id="$(echo "$line" | jq -r '.d.channel_id')"
+        if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
+          msg_id="$(echo "$line" | jq -r '.d.id')"
+          is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
+          if [ "$is_bot" != "true" ]; then
+            echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message" >> "$MESSAGES_FILE"
+          fi
+          echo "$msg_id" > "$STATE_FILE"
+        fi
+      elif [ "$t" = "READY" ]; then
+        echo "bot: session ready" >&2
+      fi
+      ;;
+    7)
+      echo "bot: server requested reconnect" >&2
+      break
+      ;;
+    9)
+      echo "bot: invalid session" >&2
+      break
+      ;;
+    11) : ;; # heartbeat ACK, nothing to do
+  esac
+done
+
+echo "bot: Gateway connection closed" >&2
