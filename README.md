@@ -173,6 +173,13 @@ timer, an Identify payload) rather than WebSocket itself. That's what
   rendered field shells out to `jq` as a separate process; fine for a
   low-traffic test channel, not a substitute for an in-process event
   loop under high message volume.
+- **Every SSE (re)connection replays the last 50 messages**, by design
+  (it's how a freshly-opened tab sees recent history). `EventSource`
+  reconnects automatically on any dropped connection — proxy idle
+  timeouts, deploys, network blips — which means that same replay can
+  happen mid-session, not just on first load. `client.js` dedupes by
+  Discord's message ID to avoid rendering the replayed backlog twice; if
+  a client is ever shown messages without stable IDs, this breaks.
 - **No log rotation.** `data/messages.jsonl` grows forever. An earlier
   version of this script trimmed it (`tail -n N | mv`), but that rename
   made `tail -F` in `handle_request.sh` re-detect the file as "new" and

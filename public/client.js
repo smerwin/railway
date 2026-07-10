@@ -68,6 +68,14 @@
 
   showEmptyState();
 
+  // Every (re)connection to /events replays the last 50 messages from
+  // scratch -- that's what lets a freshly-opened tab see recent history,
+  // but it also means EventSource's automatic reconnection (after any
+  // dropped connection: proxy idle timeouts, network blips, deploys)
+  // replays that same backlog again. Dedupe by Discord's message ID so a
+  // reconnect never renders a message twice.
+  const seenIds = new Set();
+
   // EventSource (Server-Sent Events) handles reconnection natively, so
   // there's no manual backoff/retry logic here -- the browser re-opens
   // the connection on its own after a drop.
@@ -78,8 +86,11 @@
     source.addEventListener('open', () => setStatus('connected', 'Live'));
     source.addEventListener('error', () => setStatus('disconnected', 'Reconnecting…'));
     source.addEventListener('message', (event) => {
+      const msg = JSON.parse(event.data);
+      if (seenIds.has(msg.id)) return;
+      seenIds.add(msg.id);
       clearEmptyState();
-      renderMessage(JSON.parse(event.data));
+      renderMessage(msg);
     });
   }
 
