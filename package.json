@@ -1,0 +1,23 @@
+{
+  "name": "discord-stream",
+  "version": "1.0.0",
+  "description": "Discord bot that streams channel messages to a web front-end in real time.",
+  "private": true,
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "express": "^4.21.1",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "undici": "^7.28.0"
+  }
+}
