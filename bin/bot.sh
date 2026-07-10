@@ -55,7 +55,7 @@ catch_up() {
     url="${API}?after=${after}&limit=100"
   fi
 
-  response="$(curl -sS --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
+  response="$(curl -sS --http1.1 --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
   [ -z "$response" ] && return 0
 
   if ! echo "$response" | jq -e 'type == "array"' >/dev/null 2>&1; then
