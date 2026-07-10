@@ -3,9 +3,6 @@
   const statusEl = document.getElementById('status');
   const template = document.getElementById('message-template');
 
-  let reconnectDelay = 1000;
-  const MAX_RECONNECT_DELAY = 15000;
-
   function setStatus(state, label) {
     statusEl.className = `status status--${state}`;
     statusEl.textContent = label;
@@ -13,6 +10,18 @@
 
   function isNearBottom() {
     return window.innerHeight + window.scrollY >= document.body.offsetHeight - 100;
+  }
+
+  function clearEmptyState() {
+    const empty = messagesEl.querySelector('.empty-state');
+    if (empty) empty.remove();
+  }
+
+  function showEmptyState() {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = 'No messages yet. Post one in the Discord channel!';
+    messagesEl.appendChild(empty);
   }
 
   function renderMessage(msg) {
@@ -57,47 +66,21 @@
     }
   }
 
-  function clearEmptyState() {
-    const empty = messagesEl.querySelector('.empty-state');
-    if (empty) empty.remove();
-  }
+  showEmptyState();
 
+  // EventSource (Server-Sent Events) handles reconnection natively, so
+  // there's no manual backoff/retry logic here -- the browser re-opens
+  // the connection on its own after a drop.
   function connect() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    setStatus('connecting', 'Connecting…');
+    const source = new EventSource('/events');
 
-    ws.addEventListener('open', () => {
-      setStatus('connected', 'Live');
-      reconnectDelay = 1000;
+    source.addEventListener('open', () => setStatus('connected', 'Live'));
+    source.addEventListener('error', () => setStatus('disconnected', 'Reconnecting…'));
+    source.addEventListener('message', (event) => {
+      clearEmptyState();
+      renderMessage(JSON.parse(event.data));
     });
-
-    ws.addEventListener('message', (event) => {
-      const { type, data } = JSON.parse(event.data);
-
-      if (type === 'history') {
-        messagesEl.innerHTML = '';
-        if (data.length === 0) {
-          const empty = document.createElement('p');
-          empty.className = 'empty-state';
-          empty.textContent = 'No messages yet. Post one in the Discord channel!';
-          messagesEl.appendChild(empty);
-        } else {
-          data.forEach(renderMessage);
-          window.scrollTo({ top: document.body.offsetHeight });
-        }
-      } else if (type === 'message') {
-        clearEmptyState();
-        renderMessage(data);
-      }
-    });
-
-    ws.addEventListener('close', () => {
-      setStatus('disconnected', 'Reconnecting…');
-      setTimeout(connect, reconnectDelay);
-      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
-    });
-
-    ws.addEventListener('error', () => ws.close());
   }
 
   connect();
