@@ -5,7 +5,36 @@ into a browser in real time — implemented entirely in bash (plus `curl`,
 `jq`, `socat`, and [`websocat`](https://github.com/vi/websocat)), no
 language runtime required.
 
-**Live demo:** _add your Railway URL here after deploying_
+**Live demo:** https://railway-production-240f.up.railway.app
+
+## Why bash?
+
+Because we can. There's no engineering reason to build this in bash over
+Node/Python/Go — the "Alternatives considered" section below is a running
+list of places where the honest answer to "why not do it the normal way"
+is "bash makes this harder, not better." The point of building it this way
+was to see how much of "a bot that streams a Discord channel to a live
+web page" survives when you strip away the language runtime and the
+framework and are left with only: a shell, a handful of small
+purpose-built CLI tools (`curl`, `jq`, `socat`, `websocat`), and whatever
+process/file-descriptor plumbing bash itself provides.
+
+That constraint forces you to deal directly with things a runtime
+normally hides: Discord's Gateway protocol is a raw sequence of JSON
+opcodes over a WebSocket (Hello → Identify → heartbeat-on-a-timer →
+Dispatch), and in discord.js that's a `client.on('messageCreate', ...)`
+callback — here it's a `while read` loop pattern-matching on `.op` and a
+background job sending a timestamped heartbeat, because bash doesn't have
+event listeners, only processes, pipes, and files. Concurrency isn't
+`async`/await or an event loop; it's `socat` forking a new OS process per
+HTTP connection. There's no in-memory data structure shared between "the
+part that talks to Discord" and "the part that talks to the browser"
+because those are two separate bash scripts running as two separate
+processes — so the shared state is a JSON-lines file on disk, tailed like
+a log. Every one of the "Known limitations" below is a direct consequence
+of that constraint, not a corner cut out of laziness — see
+"Alternatives considered" for what each of those trade-offs actually
+bought or cost.
 
 ## How it works
 
@@ -57,6 +86,52 @@ If the bot process dies for any reason (socket drop, Discord requesting a
 reconnect, an invalid session), `run.sh`'s supervisor loop restarts it a
 few seconds later, and it simply reconnects fresh — no session Resume is
 implemented (see Limitations).
+
+### The tricky parts
+
+A few things in `bin/bot.sh` and `bin/handle_request.sh` aren't obvious
+from reading them casually, and each cost real debugging time — worth
+calling out explicitly rather than leaving as unexplained-looking code:
+
+- **The heartbeat can't write to `${GW[1]}` directly.** The heartbeat is
+  a background job (`( while true; do sleep ...; done ) &`) so it can
+  fire on its own timer without blocking the main dispatch loop. But bash
+  closes a coprocess's file descriptors in forked child processes —
+  that's a documented bash limitation, not a bug in this script — so a
+  background job can't use `${GW[1]}` (the coproc's write end) at all;
+  attempting to write to it fails with "Bad file descriptor" every
+  time, not just at shutdown. The fix is to duplicate that fd to a fixed
+  number (`exec 70>&"${GW[1]}"`) *in the foreground*, before backgrounding
+  anything, and have the background job write to fd 70 instead. Confirmed
+  by testing against a stub `websocat` that logs everything it receives
+  on stdin: heartbeats never arrived until this fix, silently, with no
+  error visible unless stderr suppression was temporarily removed to
+  look for it.
+- **Gateway intents subscribe to every channel, not just ours.** There's
+  no per-channel Gateway subscription in Discord's API — enabling
+  `GUILD_MESSAGES` gets you `MESSAGE_CREATE` events for every channel in
+  every guild the bot can see. `DISCORD_CHANNEL_ID` only matters because
+  `bot.sh` explicitly checks `.d.channel_id` against it before appending
+  anything. This is easy to miss because it doesn't fail loudly — it
+  just quietly leaks messages from other channels into the feed. (The
+  original Node.js version had this same filter in its `messageCreate`
+  handler; it got dropped in the first pass of the bash rewrite and was
+  only caught by testing with a fake multi-channel event stream.)
+- **`tail -F` and file rotation don't mix with SSE.** Covered in
+  Limitations below, but worth flagging here as a design constraint: any
+  future change to how `messages.jsonl` is written has to preserve
+  "append-only, never rename/truncate the file out from under an active
+  `tail -F`," because a previous version that trimmed the file this way
+  caused already-connected clients to have the trimmed contents replayed
+  to them as if they were new messages.
+- **`EventSource` reconnecting is indistinguishable, from the server's
+  side, from a brand-new tab opening.** Both send a fresh request to
+  `/events` and both get the same "replay last 50, then follow" response.
+  The server has no notion of "this client already saw some of this" —
+  that had to be pushed to the client (`client.js` deduping by message
+  ID), because there's no cheap way to give a stateless-per-connection
+  shell script server the concept of a client-specific replay cursor
+  without adding real session state.
 
 ## Running locally
 
@@ -110,7 +185,8 @@ the `DOCKERFILE` builder.
 2. In the Railway project's **Variables** tab, set `DISCORD_BOT_TOKEN` and
    `DISCORD_CHANNEL_ID`. Railway supplies `PORT` automatically.
 3. Once deployed, open the generated `*.up.railway.app` URL — that's the
-   live feed.
+   live feed. This app's own instance is at
+   https://railway-production-240f.up.railway.app.
 
 ## Alternatives considered
 
