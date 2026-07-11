@@ -268,13 +268,29 @@ timer, an Identify payload) rather than WebSocket itself. That's what
      ~41s interval (as opposed to the 1s interval used in local stub
      testing, which never exercised this).
 
-  Point 3 is unconfirmed — `bot.sh` didn't log enough at the time to
-  tell "no Hello", "Hello but no Ready", and "Ready but heartbeat
-  failing" apart from each other. It now logs every dispatch op/type
-  received, every heartbeat attempt (success/failure) with its sequence
-  number, and the raw `Hello`/`Identify` exchange, so the next deploy's
-  logs should show exactly where in that sequence the connection is
-  actually dying. Unresolved as of this writing.
+  4. With that logging added, the next deploy showed something more
+     specific than point 3's guess: `Hello` arrives and gets parsed
+     correctly (`heartbeat_interval=41250ms`), `Identify` gets sent —
+     and then *nothing*. No `Ready`, no `Invalid Session`, not even one
+     more dispatch logged, before the close. That rules out the
+     heartbeat-timing theory (it never got far enough to need a
+     heartbeat) and points at something rejecting the session
+     immediately upon processing `Identify` specifically.
+
+     Discord documents exactly this class of limit: a bot token gets a
+     capped number of `Identify` calls per rolling window (1000/day),
+     plus a `max_concurrency` on session starts. Given how aggressively
+     this bot was reconnecting before the backoff fix — a fixed 3-second
+     loop, for however long the earlier close-before-`Hello` failures
+     had been going on — it's plausible this token burned through that
+     budget. Unlike the earlier theories, this one is directly checkable
+     rather than inferred: Discord's `GET /gateway/bot` endpoint returns
+     the exact remaining count. `bot.sh` now logs it
+     (`bot: session_start_limit: {...}`) before every connection
+     attempt, so the next deploy's logs will show `remaining` and
+     `reset_after` directly instead of more speculation.
+
+  Unresolved as of this writing, pending that log line.
 
   Two changes from earlier rounds remain in place regardless of which
   theory turns out to be right: `run.sh` backs off exponentially (3s →

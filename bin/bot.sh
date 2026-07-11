@@ -91,6 +91,18 @@ catch_up
 gw_probe_code="$(curl -sS --http1.1 --max-time 5 -o /dev/null -w '%{http_code}' "https://gateway.discord.gg/?v=10&encoding=json" 2>&1)"
 echo "bot: pre-flight HTTPS check to gateway.discord.gg: ${gw_probe_code}" >&2
 
+# Diagnostic: Discord's own accounting of this bot token's remaining
+# Identify budget (documented as 1000/day, resetting on a rolling
+# window). If the connection is dying right after Identify with no
+# further response -- no Ready, no Invalid Session, nothing -- and
+# "remaining" here is 0 or very low, that's a directly-checkable
+# explanation, rather than continuing to guess: the earlier fixed
+# 3-second retry loop (before backoff was added) may have burned through
+# this token's daily Identify budget by reconnecting that aggressively
+# for an extended period.
+session_limit_info="$(curl -sS --http1.1 --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "https://discord.com/api/v10/gateway/bot" 2>&1)"
+echo "bot: session_start_limit: $(echo "$session_limit_info" | jq -c '.session_start_limit // .' 2>/dev/null)" >&2
+
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
