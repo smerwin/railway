@@ -94,16 +94,28 @@ echo "bot: pre-flight HTTPS check to gateway.discord.gg: ${gw_probe_code}" >&2
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
-coproc GW { exec websocat -v -B 1000000 "$GATEWAY_URL"; }
+coproc GW { exec websocat -v -B 1000000 -H "User-Agent: DiscordBot (https://github.com/smerwin/railway, 1.0)" "$GATEWAY_URL"; }
 
 cleanup() {
   [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
-  [ -n "${GW_PID:-}" ] && kill "$GW_PID" 2>/dev/null
+  # -9: observed websocat taking a long time to exit on its own after
+  # Discord closes the connection without a Hello -- no reason to wait
+  # on a graceful shutdown from a connection we've already given up on.
+  [ -n "${GW_PID:-}" ] && kill -9 "$GW_PID" 2>/dev/null
 }
 trap cleanup EXIT
 
-if ! IFS= read -r -u "${GW[0]}" hello_line; then
-  echo "bot: no Hello received from Gateway, exiting" >&2
+# Waiting for Hello should be near-instant under normal operation --
+# unlike the main dispatch loop below, where long gaps between reads are
+# normal on a quiet channel, so a timeout here can't false-positive on
+# "healthy but idle." Enforced with our own timeout (rather than just
+# waiting for websocat's stdout to hit EOF) because websocat has been
+# observed taking upwards of a minute to actually close its pipe after
+# Discord sends a WebSocket close frame with no Hello -- trusting its
+# own shutdown timing turned "reconnect every few seconds" into
+# "reconnect every couple of minutes."
+if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
+  echo "bot: no Hello received from Gateway within 10s, exiting" >&2
   exit 1
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
