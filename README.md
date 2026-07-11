@@ -290,27 +290,64 @@ timer, an Identify payload) rather than WebSocket itself. That's what
      attempt, so the next deploy's logs will show `remaining` and
      `reset_after` directly instead of more speculation.
 
-  Unresolved as of this writing, pending that log line.
+  5. The next deploy's `session_start_limit` log came back completely
+     clean — `remaining: 1000` of `1000` — ruling out the Identify-budget
+     theory outright. Message Content Intent was also confirmed already
+     enabled in the Developer Portal (ruling out the same 4014 rejection
+     I'd independently hit in an earlier, unrelated test with this
+     token). Both plausible, checkable theories, both eliminated.
+  6. That left one piece of information neither `bot.sh` nor `websocat
+     -v` could surface: the actual numeric WebSocket close code Discord
+     sends (`websocat` has no flag for it). A small Node.js script using
+     the `ws` library — which does expose `code`/`reason` on close —
+     run from a non-Railway network with the identical token and
+     intents, completed a full session cleanly: `Hello` → `Identify` →
+     `Ready` → `Guild_Create`, closed normally. Token, intents, and
+     payload shape were all fine.
+  7. That still left two candidates: Railway's network, or `websocat`
+     itself as a client (maybe its framing/timing of `Identify`
+     specifically). Deciding between them needed the *same tool*
+     (`websocat`) tested through a *full* Identify from a non-Railway
+     network — something the very first cross-network test (point 2)
+     hadn't actually done; it only confirmed `Hello` arrived, then
+     stopped there. Doing that properly settled it: `websocat`, from the
+     same home network, sent the identical `Identify` payload bot.sh
+     sends and got back a complete, successful session (`READY` as the
+     bot user, a real `GUILD_CREATE` for the target server).
 
-  Two changes from earlier rounds remain in place regardless of which
-  theory turns out to be right: `run.sh` backs off exponentially (3s →
-  60s cap, resetting after a 30s+ run) instead of hammering the Gateway
-  on a fixed 3s loop, and `bot.sh` bounds the wait for `Hello` to 10
-  seconds with a forceful (`kill -9`) cleanup, rather than trusting
-  `websocat`'s own shutdown timing — the latter is what turned "retry
-  every few seconds" into "retry every couple of minutes" and is very
-  likely the real explanation for "messages take minutes to appear."
-  A speculative `User-Agent` header (in case bot-detection heuristics
-  were involved) was tried and reverted after it hit a `websocat -H`
-  argument-parsing gotcha with no local binary available to verify a
-  fix against.
+  Conclusion: every application-level variable (token, intents, rate
+  limit, payload shape, client library) has been tested and eliminated.
+  The one remaining difference between a working session and a failing
+  one is the network it originates from. This points at Railway's
+  shared egress IP range specifically being rejected by Discord at
+  session-creation time — which fits the observed shape of the failure
+  (the WS handshake and `Hello` succeed fine even from Railway, since
+  that doesn't touch session state; the close consistently happens right
+  at `Identify`, the first point where Discord's backend would actually
+  create one). This isn't something fixable in this codebase; it's a
+  network-level property of the hosting platform. The path forward, if
+  pursued, is on Railway's side (a static/dedicated egress IP, if
+  available, on the chance it's allocated from a cleaner pool) rather
+  than anything in `bot.sh`.
 
-  Outbound IPv6 was also considered as a way to sidestep a
-  possibly-flagged shared IPv4 range, but ruled out by DNS lookup:
-  neither `discord.com` nor `gateway.discord.gg` publish an `AAAA`
-  record at all (confirmed against `www.cloudflare.com`, which does, to
-  rule out a resolver-level false negative) — there's no IPv6 address
-  to connect to regardless of what Railway or `websocat` support.
+  Several fixes from earlier rounds of this investigation remain
+  worthwhile regardless: `run.sh` backs off exponentially (3s → 60s cap,
+  resetting after a 30s+ run) instead of hammering the Gateway on a
+  fixed 3s loop, `bot.sh` bounds the wait for `Hello` to 10 seconds with
+  a forceful (`kill -9`) cleanup rather than trusting `websocat`'s own
+  shutdown timing (which is what turned "retry every few seconds" into
+  "retry every couple of minutes" and is likely the real explanation for
+  why messages were taking minutes to appear, independent of the network
+  issue above), and the dispatch/heartbeat logging added along the way
+  is useful instrumentation on its own merits.
+
+  Two things tried and abandoned: a speculative `User-Agent` header (in
+  case bot-detection heuristics were involved) hit a `websocat -H`
+  argument-parsing gotcha with no local binary available to verify a fix
+  against, and outbound IPv6 was ruled out by DNS lookup before writing
+  any code — neither `discord.com` nor `gateway.discord.gg` publish an
+  `AAAA` record at all (confirmed against `www.cloudflare.com`, which
+  does, to rule out a resolver-level false negative).
 - **No session Resume.** Real Discord clients reconnect with a `Resume`
   (op 6) using the last session ID + sequence number, replaying only
   what was missed. This bot doesn't implement that: every reconnect is a
