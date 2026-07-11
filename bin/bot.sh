@@ -12,6 +12,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/config.sh"
 : "${DISCORD_BOT_TOKEN:?Set DISCORD_BOT_TOKEN}"
 : "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID}"
 
+# Defensive: strip any leading/trailing whitespace picked up from however
+# the variable was set (e.g. a trailing newline pasted into a dashboard).
+# REST calls embed the token in an HTTP header, which servers commonly
+# trim -- but the Gateway Identify embeds it as a raw JSON string value,
+# compared byte-for-byte, where stray whitespace would silently break
+# authentication while REST calls using the same variable kept working.
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN#"${DISCORD_BOT_TOKEN%%[![:space:]]*}"}"
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN%"${DISCORD_BOT_TOKEN##*[![:space:]]}"}"
+
 API="https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages"
 GATEWAY_URL="wss://gateway.discord.gg/?v=10&encoding=json"
 # GUILDS (1<<0) + GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15)
@@ -23,10 +32,13 @@ touch "$MESSAGES_FILE"
 
 # jq function mapping one raw Discord message object to the shape the
 # front-end expects. Shared (as inlined text) between the REST catch-up
-# path and the live Gateway dispatch path below.
+# path and the live Gateway dispatch path below. Takes the record "kind"
+# (create/update) as a parameter so the front-end can tell an edit from a
+# brand-new message without a separate schema.
 read -r -d '' TO_FEED_MESSAGE_DEF <<'JQ'
-def to_feed_message:
+def to_feed_message(kind):
   {
+    kind: kind,
     id: .id,
     authorId: .author.id,
     authorName: (.member.nick // .author.global_name // .author.username // "Unknown"),
@@ -39,6 +51,7 @@ def to_feed_message:
     ),
     content: .content,
     createdAt: .timestamp,
+    editedAt: (.edited_timestamp // null),
     attachments: [.attachments[] | {url: .url, name: .filename, contentType: .content_type}]
   };
 JQ
@@ -67,7 +80,7 @@ catch_up() {
   if [ "$count" != "0" ]; then
     echo "$response" | jq -c "
       ${TO_FEED_MESSAGE_DEF}
-      reverse | .[] | select(.author.bot != true) | to_feed_message
+      reverse | .[] | select(.author.bot != true) | to_feed_message(\"create\")
     " >> "$MESSAGES_FILE"
     after="$(echo "$response" | jq -r '.[0].id')"
     echo "$after" > "$STATE_FILE"
@@ -80,16 +93,28 @@ catch_up
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
-coproc GW { exec websocat -B 1000000 "$GATEWAY_URL"; }
+coproc GW { exec websocat -v -B 1000000 "$GATEWAY_URL"; }
 
 cleanup() {
   [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
-  [ -n "${GW_PID:-}" ] && kill "$GW_PID" 2>/dev/null
+  # -9: observed websocat taking a long time to exit on its own after
+  # Discord closes the connection without a Hello -- no reason to wait
+  # on a graceful shutdown from a connection we've already given up on.
+  [ -n "${GW_PID:-}" ] && kill -9 "$GW_PID" 2>/dev/null
 }
 trap cleanup EXIT
 
-if ! IFS= read -r -u "${GW[0]}" hello_line; then
-  echo "bot: no Hello received from Gateway, exiting" >&2
+# Waiting for Hello should be near-instant under normal operation --
+# unlike the main dispatch loop below, where long gaps between reads are
+# normal on a quiet channel, so a timeout here can't false-positive on
+# "healthy but idle." Enforced with our own timeout (rather than just
+# waiting for websocat's stdout to hit EOF) because websocat has been
+# observed taking upwards of a minute to actually close its pipe after
+# Discord sends a WebSocket close frame with no Hello -- trusting its
+# own shutdown timing turned "reconnect every few seconds" into
+# "reconnect every couple of minutes."
+if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
+  echo "bot: no Hello received from Gateway within 10s, exiting" >&2
   exit 1
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
@@ -130,7 +155,7 @@ while IFS= read -r -u "${GW[0]}" line; do
   case "$op" in
     0)
       t="$(echo "$line" | jq -r '.t')"
-      if [ "$t" = "MESSAGE_CREATE" ]; then
+      if [ "$t" = "MESSAGE_CREATE" ] || [ "$t" = "MESSAGE_UPDATE" ]; then
         # Intents subscribe to every channel in every guild the bot can
         # see, not just ours -- Discord has no per-channel Gateway
         # subscription, so the channel filter has to happen here.
@@ -138,10 +163,30 @@ while IFS= read -r -u "${GW[0]}" line; do
         if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
           msg_id="$(echo "$line" | jq -r '.d.id')"
           is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
-          if [ "$is_bot" != "true" ]; then
-            echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message" >> "$MESSAGES_FILE"
+          # MESSAGE_UPDATE can arrive as a partial payload (e.g. Discord
+          # generating a link-preview embed touches no text) -- .content
+          # missing/null means there's no text edit to show, so skip it.
+          has_content="$(echo "$line" | jq -r '.d.content != null')"
+          if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
+            if [ "$t" = "MESSAGE_CREATE" ]; then
+              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"create\")" >> "$MESSAGES_FILE"
+            else
+              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"update\")" >> "$MESSAGES_FILE"
+            fi
           fi
-          echo "$msg_id" > "$STATE_FILE"
+          # Edits reuse the original message's ID, which is always <= the
+          # newest ID we've already recorded -- only creates should ever
+          # advance the REST catch-up cursor.
+          [ "$t" = "MESSAGE_CREATE" ] && echo "$msg_id" > "$STATE_FILE"
+        fi
+      elif [ "$t" = "MESSAGE_DELETE" ]; then
+        # MESSAGE_DELETE's payload is just {id, channel_id[, guild_id]}
+        # -- no author, no content -- so it can't share the create/update
+        # path above at all; there's nothing to filter by author/content,
+        # only by channel.
+        channel_id="$(echo "$line" | jq -r '.d.channel_id')"
+        if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
+          echo "$line" | jq -c '{kind: "delete", id: .d.id}' >> "$MESSAGES_FILE"
         fi
       elif [ "$t" = "READY" ]; then
         echo "bot: session ready" >&2

@@ -48,9 +48,13 @@ Everything runs as two shell scripts inside one container:
    - sends an `Identify` payload with the bot token and intents,
    - runs a background loop that sends a heartbeat on that interval,
    - and reads dispatch events in the foreground, picking out
-     `MESSAGE_CREATE` events, reshaping each with `jq` into a small JSON
-     object (author, avatar URL, content, timestamp, attachments), and
-     appending it as one line to `data/messages.jsonl`.
+     `MESSAGE_CREATE`, `MESSAGE_UPDATE` (edits), and `MESSAGE_DELETE`
+     events for our channel. Creates and updates get reshaped with `jq`
+     into a small JSON object (author, avatar URL, content, timestamp,
+     attachments) tagged with a `kind`; deletes — whose Gateway payload
+     is just `{id, channel_id}`, nothing else — become a bare
+     `{"kind":"delete","id":...}`. Each becomes one line appended to
+     `data/messages.jsonl`.
 
    Before connecting (and again after every reconnect), it does one REST
    catch-up call — `GET /channels/{id}/messages?after=<last-seen-id>` —
@@ -232,6 +236,134 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 
 ## Known limitations
 
+- **Resolved: the Discord Gateway connection didn't survive long enough
+  to become a stable session.** Root cause turned out to be a single
+  whitespace character in a config value, not a bug in this codebase —
+  but it took a long chain of hypotheses to get there, worth recording
+  in full since most of them didn't pan out:
+
+  1. Initial deploy logs showed `websocat: WebSocketError: I/O failure`
+     with no detail. Adding `websocat -v` revealed the real picture: TCP
+     connects, TLS succeeds, the WS upgrade itself succeeds (matching
+     `sec-websocket-accept`) — then a close frame arrives, sometimes
+     before `Hello` is ever sent, sometimes (per later logs) after.
+  2. The close responses carry a Cloudflare `__cf_bm` bot-management
+     cookie, which looked like a smoking gun for IP-reputation-based
+     blocking on Railway's shared egress range. That theory took a real
+     hit when `websocat` run from a non-Railway network hit the *exact
+     same* immediate-close behavior — same tool, different network, same
+     result — which argued against "it's Railway's IP" specifically.
+     (In hindsight, `__cf_bm` is issued on most connections through
+     Cloudflare's edge regardless of whether anything gets blocked, so
+     its presence alone was weaker evidence than it looked.)
+  3. Per-line deploy log timestamps then showed something orthogonal:
+     `run.sh: bot exited after 83s` — identically, three restarts in a
+     row. A fixed, exactly-repeated duration across attempts (not
+     jittery like real network variance) pointed at an internal timeout
+     rather than an external block. 83s is suspiciously close to 2×
+     Discord's real heartbeat interval (41.25s) — the standard "zombied
+     connection" grace period Gateway implementations use when a client
+     doesn't heartbeat in time. That would mean the connection *is*
+     surviving past `Hello`/`Identify`, and something in `bot.sh`'s own
+     heartbeat delivery isn't reliably reaching Discord over a real
+     ~41s interval (as opposed to the 1s interval used in local stub
+     testing, which never exercised this).
+
+  4. With that logging added, the next deploy showed something more
+     specific than point 3's guess: `Hello` arrives and gets parsed
+     correctly (`heartbeat_interval=41250ms`), `Identify` gets sent —
+     and then *nothing*. No `Ready`, no `Invalid Session`, not even one
+     more dispatch logged, before the close. That rules out the
+     heartbeat-timing theory (it never got far enough to need a
+     heartbeat) and points at something rejecting the session
+     immediately upon processing `Identify` specifically.
+
+     Discord documents exactly this class of limit: a bot token gets a
+     capped number of `Identify` calls per rolling window (1000/day),
+     plus a `max_concurrency` on session starts. Given how aggressively
+     this bot was reconnecting before the backoff fix — a fixed 3-second
+     loop, for however long the earlier close-before-`Hello` failures
+     had been going on — it's plausible this token burned through that
+     budget. Unlike the earlier theories, this one is directly checkable
+     rather than inferred: Discord's `GET /gateway/bot` endpoint returns
+     the exact remaining count. `bot.sh` now logs it
+     (`bot: session_start_limit: {...}`) before every connection
+     attempt, so the next deploy's logs will show `remaining` and
+     `reset_after` directly instead of more speculation.
+
+  5. The next deploy's `session_start_limit` log came back completely
+     clean — `remaining: 1000` of `1000` — ruling out the Identify-budget
+     theory outright. Message Content Intent was also confirmed already
+     enabled in the Developer Portal (ruling out the same 4014 rejection
+     I'd independently hit in an earlier, unrelated test with this
+     token). Both plausible, checkable theories, both eliminated.
+  6. That left one piece of information neither `bot.sh` nor `websocat
+     -v` could surface: the actual numeric WebSocket close code Discord
+     sends (`websocat` has no flag for it). A small Node.js script using
+     the `ws` library — which does expose `code`/`reason` on close —
+     run from a non-Railway network with the identical token and
+     intents, completed a full session cleanly: `Hello` → `Identify` →
+     `Ready` → `Guild_Create`, closed normally. Token, intents, and
+     payload shape were all fine.
+  7. That still left two candidates: Railway's network, or `websocat`
+     itself as a client (maybe its framing/timing of `Identify`
+     specifically). Deciding between them needed the *same tool*
+     (`websocat`) tested through a *full* Identify from a non-Railway
+     network — something the very first cross-network test (point 2)
+     hadn't actually done; it only confirmed `Hello` arrived, then
+     stopped there. Doing that properly settled it: `websocat`, from the
+     same home network, sent the identical `Identify` payload bot.sh
+     sends and got back a complete, successful session (`READY` as the
+     bot user, a real `GUILD_CREATE` for the target server).
+
+  8. Point 7 left the network as the only remaining variable, by
+     elimination — every application-level thing (token, intents, rate
+     limit, payload shape, client library) had been tested and cleared.
+     That reasoning was sound, but the elimination itself had a gap: a
+     small diagnostic script logging the token's exact length, before
+     and after trimming, without ever printing the token itself, found
+     it — 73 characters raw, 72 trimmed. One stray whitespace character
+     in Railway's `DISCORD_BOT_TOKEN` value. REST calls tolerated it
+     silently (an HTTP `Authorization` header, commonly trimmed by
+     servers); the Gateway's `Identify` didn't (a raw JSON string,
+     compared byte-for-byte) — which is exactly the REST-succeeds/
+     Gateway-fails asymmetry that had been the central puzzle since
+     point 4, and exactly why `websocat` failed identically to real
+     Node/`ws` once tested with the actual production token: both were
+     sending the same corrupted string.
+
+  Actual resolution: `bot.sh` now trims `DISCORD_BOT_TOKEN` before using
+  it (pure bash parameter expansion, no subshell). Every network-level
+  theory in this section — Cloudflare bot-management, IP reputation,
+  Railway's egress range — was a red herring. The entire investigation,
+  start to finish, was chasing a config data-entry error: one whitespace
+  character, pasted into a dashboard text field, invisible there,
+  silently tolerated by every REST call this bot made, and fatal to
+  every single Gateway connection attempt.
+
+  A brief apology to Railway's network team: a large fraction of this
+  document accused your shared egress IP range of being reputation-
+  flagged, rate-limited, or otherwise unwelcome at Discord's door. It
+  was never your network. It was whitespace. Sorry.
+
+  Several fixes from earlier rounds of this investigation remain
+  worthwhile regardless: `run.sh` backs off exponentially (3s → 60s cap,
+  resetting after a 30s+ run) instead of hammering the Gateway on a
+  fixed 3s loop, `bot.sh` bounds the wait for `Hello` to 10 seconds with
+  a forceful (`kill -9`) cleanup rather than trusting `websocat`'s own
+  shutdown timing (which is what turned "retry every few seconds" into
+  "retry every couple of minutes" and is likely the real explanation for
+  why messages were taking minutes to appear, independent of the network
+  issue above), and the dispatch/heartbeat logging added along the way
+  is useful instrumentation on its own merits.
+
+  Two things tried and abandoned: a speculative `User-Agent` header (in
+  case bot-detection heuristics were involved) hit a `websocat -H`
+  argument-parsing gotcha with no local binary available to verify a fix
+  against, and outbound IPv6 was ruled out by DNS lookup before writing
+  any code — neither `discord.com` nor `gateway.discord.gg` publish an
+  `AAAA` record at all (confirmed against `www.cloudflare.com`, which
+  does, to rule out a resolver-level false negative).
 - **No session Resume.** Real Discord clients reconnect with a `Resume`
   (op 6) using the last session ID + sequence number, replaying only
   what was missed. This bot doesn't implement that: every reconnect is a
@@ -275,8 +407,19 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 - **One hard-coded channel**, and **no auth** on the front-end — anyone
   with the URL can view the feed. Both fine for a demo on a throwaway
   test channel, not for a private/production channel.
-- **No message edit/delete handling** — only `MESSAGE_CREATE` is
-  handled; edits and deletions in Discord aren't reflected.
+- **Live edits and deletes are handled; ones missed while disconnected
+  aren't.** `MESSAGE_UPDATE` and `MESSAGE_DELETE` both update the DOM in
+  place by looking up the existing message via its Discord message ID
+  (`(edited)` marker for updates, removal for deletes). But `catch_up`'s
+  REST call only fetches messages *after* the last-seen ID — it has no
+  way to learn that an older, already-recorded message was edited or
+  deleted while the bot was disconnected, since Discord's message-list
+  endpoint doesn't surface a "deleted" state at all, and only returns a
+  message's *current* content, not a diff. An edit/delete of a message
+  the client never rendered in the first place (outside the last-50
+  replay window) is a no-op for a delete, and falls back to appearing as
+  a new entry for an edit — better than silently dropping it, but not
+  fully correct either.
 - **Attachments are linked, not proxied** — images/files point directly
   at Discord's CDN URLs, which are time-limited signed URLs; fine for
   live viewing, but a link shared later may expire.

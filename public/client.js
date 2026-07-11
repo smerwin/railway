@@ -24,9 +24,27 @@
     messagesEl.appendChild(empty);
   }
 
+  function setEditedMarker(articleEl, msg) {
+    let marker = articleEl.querySelector('.edited-marker');
+    if (msg.editedAt) {
+      if (!marker) {
+        marker = document.createElement('span');
+        marker.className = 'edited-marker';
+        articleEl.querySelector('.message-meta').appendChild(marker);
+      }
+      marker.textContent = '(edited)';
+      marker.title = new Date(msg.editedAt).toLocaleString();
+    } else if (marker) {
+      marker.remove();
+    }
+  }
+
   function renderMessage(msg) {
     const wasNearBottom = isNearBottom();
     const node = template.content.cloneNode(true);
+
+    const article = node.querySelector('.message');
+    article.dataset.messageId = msg.id;
 
     const avatar = node.querySelector('.avatar');
     avatar.src = msg.authorAvatarURL || '';
@@ -60,10 +78,26 @@
     }
 
     messagesEl.appendChild(node);
+    setEditedMarker(messagesEl.lastElementChild, msg);
 
     if (wasNearBottom) {
       window.scrollTo({ top: document.body.offsetHeight });
     }
+  }
+
+  // Returns true if an existing message was found and updated in place.
+  function updateMessage(msg) {
+    const article = messagesEl.querySelector(`[data-message-id="${msg.id}"]`);
+    if (!article) return false;
+    article.querySelector('.content').textContent = msg.content;
+    setEditedMarker(article, msg);
+    return true;
+  }
+
+  function removeMessage(id) {
+    const article = messagesEl.querySelector(`[data-message-id="${id}"]`);
+    if (article) article.remove();
+    if (!messagesEl.querySelector('.message')) showEmptyState();
   }
 
   showEmptyState();
@@ -72,9 +106,9 @@
   // scratch -- that's what lets a freshly-opened tab see recent history,
   // but it also means EventSource's automatic reconnection (after any
   // dropped connection: proxy idle timeouts, network blips, deploys)
-  // replays that same backlog again. Dedupe by Discord's message ID so a
-  // reconnect never renders a message twice.
-  const seenIds = new Set();
+  // replays that same backlog again. Track every message ID we've
+  // rendered so a reconnect's replay never renders a "create" twice.
+  const renderedIds = new Set();
 
   // EventSource (Server-Sent Events) handles reconnection natively, so
   // there's no manual backoff/retry logic here -- the browser re-opens
@@ -87,8 +121,30 @@
     source.addEventListener('error', () => setStatus('disconnected', 'Reconnecting…'));
     source.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
-      if (seenIds.has(msg.id)) return;
-      seenIds.add(msg.id);
+
+      if (msg.kind === 'delete') {
+        // Deliberately not removing msg.id from renderedIds: if this
+        // delete is later replayed after an SSE reconnect (along with
+        // the original create, both inside the last-50 window), leaving
+        // the ID marked "seen" means the replayed create is skipped
+        // entirely instead of flashing back in right before the
+        // replayed delete removes it again.
+        removeMessage(msg.id);
+        return;
+      }
+
+      if (msg.kind === 'update') {
+        // Re-applying an edit that was already applied (e.g. replayed
+        // after an SSE reconnect) is harmless and idempotent. If the
+        // original message isn't currently rendered at all (edit of
+        // something outside the last-50 replay window), fall back to
+        // showing it as a new entry -- better than dropping it silently.
+        if (updateMessage(msg)) return;
+      } else if (renderedIds.has(msg.id)) {
+        return;
+      }
+
+      renderedIds.add(msg.id);
       clearEmptyState();
       renderMessage(msg);
     });
