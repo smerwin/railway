@@ -236,51 +236,65 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 
 ## Known limitations
 
-- **Open issue: Discord's Gateway closes the connection immediately
-  after a successful WebSocket handshake, on every attempt.** `websocat
-  -v` logs now show the full picture: TCP connects, TLS succeeds, the WS
-  upgrade itself succeeds (matching `sec-websocket-accept`, proper
-  `Connection: upgrade` headers from Cloudflare) — then Discord sends a
-  WS close frame before ever sending the Gateway's `Hello` payload. The
-  connection is structurally fine; something about *this* connection (or
-  this source IP) is being rejected right after the handshake completes.
-  The leading hypothesis: `run.sh`'s old fixed 3-second restart loop had
-  no backoff, so a persistent failure meant hammering Discord's
-  Cloudflare-fronted Gateway edge with a fresh reconnect every 3 seconds
-  indefinitely — a pattern that plausibly earns a temporary rate-limit
-  or soft-block, and continuing to hammer it wouldn't let any such block
-  clear. `run.sh` now backs off exponentially (3s → 60s cap) on fast
-  failures and resets once a connection lasts 30s+, without being
-  certain that's the whole story.
+- **Open issue: the Discord Gateway connection doesn't survive long
+  enough to become a stable session.** This one went through a few
+  rounds of hypotheses as more evidence came in, worth recording since
+  none of the earlier ones panned out cleanly:
 
-  A descriptive `User-Agent` header on the Gateway handshake was also
-  tried, on the theory that Cloudflare's bot-detection heuristics might
-  be a factor — but `websocat -H` turned out to have a parsing gotcha
-  (its docs warn the space-separated form can greedily consume the next
-  argument too, and it did: it ate `$GATEWAY_URL`, briefly breaking the
-  connection entirely with "No URL specified"). With no working
-  `websocat` binary in this environment to verify the fix against
-  directly, and the User-Agent theory being speculative to begin with,
-  it was dropped rather than risk a second blind guess at the correct
-  flag syntax.
+  1. Initial deploy logs showed `websocat: WebSocketError: I/O failure`
+     with no detail. Adding `websocat -v` revealed the real picture: TCP
+     connects, TLS succeeds, the WS upgrade itself succeeds (matching
+     `sec-websocket-accept`) — then a close frame arrives, sometimes
+     before `Hello` is ever sent, sometimes (per later logs) after.
+  2. The close responses carry a Cloudflare `__cf_bm` bot-management
+     cookie, which looked like a smoking gun for IP-reputation-based
+     blocking on Railway's shared egress range. That theory took a real
+     hit when `websocat` run from a non-Railway network hit the *exact
+     same* immediate-close behavior — same tool, different network, same
+     result — which argued against "it's Railway's IP" specifically.
+     (In hindsight, `__cf_bm` is issued on most connections through
+     Cloudflare's edge regardless of whether anything gets blocked, so
+     its presence alone was weaker evidence than it looked.)
+  3. Per-line deploy log timestamps then showed something orthogonal:
+     `run.sh: bot exited after 83s` — identically, three restarts in a
+     row. A fixed, exactly-repeated duration across attempts (not
+     jittery like real network variance) pointed at an internal timeout
+     rather than an external block. 83s is suspiciously close to 2×
+     Discord's real heartbeat interval (41.25s) — the standard "zombied
+     connection" grace period Gateway implementations use when a client
+     doesn't heartbeat in time. That would mean the connection *is*
+     surviving past `Hello`/`Identify`, and something in `bot.sh`'s own
+     heartbeat delivery isn't reliably reaching Discord over a real
+     ~41s interval (as opposed to the 1s interval used in local stub
+     testing, which never exercised this).
 
-  Separately — and this is the part that explains "messages take minutes
-  to show up" specifically — the `Date:` header timestamps embedded in
-  Discord's own close responses, across consecutive attempts, were ~86
-  seconds apart, not the ~3 seconds `run.sh` was actually sleeping for.
-  `websocat` was taking the better part of a minute to actually close
-  its own stdout pipe after logging the close frame internally (visible
-  only via `-v`, not via the data stream `bot.sh` reads), and `bot.sh`
-  was just blocked waiting on that EOF. Fixed by not trusting
-  `websocat`'s own shutdown timing at all: the initial `read` waiting
-  for `Hello` now has its own 10-second timeout, and cleanup uses
-  `kill -9` on the Gateway coproc rather than a plain `kill`, so a
-  failed connection attempt is bounded at ~10s no matter how long
-  `websocat` itself would've taken to notice and exit.
+  Point 3 is unconfirmed — `bot.sh` didn't log enough at the time to
+  tell "no Hello", "Hello but no Ready", and "Ready but heartbeat
+  failing" apart from each other. It now logs every dispatch op/type
+  received, every heartbeat attempt (success/failure) with its sequence
+  number, and the raw `Hello`/`Identify` exchange, so the next deploy's
+  logs should show exactly where in that sequence the connection is
+  actually dying. Unresolved as of this writing.
 
-  Unresolved as of this writing: *why* Discord closes the connection
-  before `Hello` in the first place. If the backoff change doesn't
-  resolve it, the `-v` output is the next place to look.
+  Two changes from earlier rounds remain in place regardless of which
+  theory turns out to be right: `run.sh` backs off exponentially (3s →
+  60s cap, resetting after a 30s+ run) instead of hammering the Gateway
+  on a fixed 3s loop, and `bot.sh` bounds the wait for `Hello` to 10
+  seconds with a forceful (`kill -9`) cleanup, rather than trusting
+  `websocat`'s own shutdown timing — the latter is what turned "retry
+  every few seconds" into "retry every couple of minutes" and is very
+  likely the real explanation for "messages take minutes to appear."
+  A speculative `User-Agent` header (in case bot-detection heuristics
+  were involved) was tried and reverted after it hit a `websocat -H`
+  argument-parsing gotcha with no local binary available to verify a
+  fix against.
+
+  Outbound IPv6 was also considered as a way to sidestep a
+  possibly-flagged shared IPv4 range, but ruled out by DNS lookup:
+  neither `discord.com` nor `gateway.discord.gg` publish an `AAAA`
+  record at all (confirmed against `www.cloudflare.com`, which does, to
+  rule out a resolver-level false negative) — there's no IPv6 address
+  to connect to regardless of what Railway or `websocat` support.
 - **No session Resume.** Real Discord clients reconnect with a `Resume`
   (op 6) using the last session ID + sequence number, replaying only
   what was missed. This bot doesn't implement that: every reconnect is a

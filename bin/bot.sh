@@ -128,11 +128,13 @@ if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
 interval_sec="$(awk "BEGIN { printf \"%.3f\", ${interval_ms}/1000 }")"
+echo "bot: got Hello, heartbeat_interval=${interval_ms}ms (${interval_sec}s)" >&2
 
 identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS" '
   {op: 2, d: {token: $token, intents: $intents, properties: {os: "linux", browser: "bash-discord-bot", device: "bash-discord-bot"}}}
 ')"
 printf '%s\n' "$identify" >&"${GW[1]}"
+echo "bot: sent Identify" >&2
 
 # Heartbeat loop: runs as a background job writing to the coproc's stdin
 # on a timer. Bash closes a coprocess's file descriptors in forked child
@@ -147,7 +149,12 @@ exec 70>&"${GW[1]}"
   while true; do
     sleep "$interval_sec"
     seq="$(cat "$SEQ_FILE")"
-    { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null || exit 0
+    if { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null; then
+      echo "bot: sent heartbeat (seq=${seq})" >&2
+    else
+      echo "bot: heartbeat write failed (coproc pipe closed), stopping heartbeat loop" >&2
+      exit 0
+    fi
   done
 ) &
 HEARTBEAT_PID=$!
@@ -159,6 +166,8 @@ HEARTBEAT_PID=$!
 while IFS= read -r -u "${GW[0]}" line; do
   op="$(echo "$line" | jq -r '.op')"
   seq="$(echo "$line" | jq -r '.s // empty')"
+  dispatch_t="$(echo "$line" | jq -r '.t // empty')"
+  echo "bot: recv op=${op}${dispatch_t:+ t=$dispatch_t}${seq:+ seq=$seq}" >&2
   [ -n "$seq" ] && echo "$seq" > "$SEQ_FILE"
 
   case "$op" in
