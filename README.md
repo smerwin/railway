@@ -232,6 +232,19 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 
 ## Known limitations
 
+- **Open issue: `websocat` fails to connect to Discord's Gateway from
+  Railway ("WebSocketError: I/O failure"), consistently, not
+  intermittently.** `run.sh`'s supervisor loop keeps the container alive
+  by restarting `bot.sh` every 3s (working as designed — the web server
+  is unaffected, since it's a separate process), but that's a symptom
+  mask, not a fix, if every single attempt fails. `curl` reaching
+  Discord's REST API doesn't rule this out, since that's a different
+  hostname/edge than `gateway.discord.gg`. `bot.sh` now logs a plain
+  HTTPS probe to that same host (`bot: pre-flight HTTPS check to
+  gateway.discord.gg: <code>`) and runs `websocat -v` for more detail, to
+  tell apart "this host is unreachable from Railway at all" from
+  "something specific to the WebSocket upgrade/TLS handshake" the next
+  time it fails. Unresolved as of this writing.
 - **No session Resume.** Real Discord clients reconnect with a `Resume`
   (op 6) using the last session ID + sequence number, replaying only
   what was missed. This bot doesn't implement that: every reconnect is a
@@ -275,8 +288,15 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 - **One hard-coded channel**, and **no auth** on the front-end — anyone
   with the URL can view the feed. Both fine for a demo on a throwaway
   test channel, not for a private/production channel.
-- **No message edit/delete handling** — only `MESSAGE_CREATE` is
-  handled; edits and deletions in Discord aren't reflected.
+- **Message deletes aren't handled.** `MESSAGE_UPDATE` (edits) is now
+  handled live — the client finds the existing rendered message by
+  Discord's message ID and updates its content in place, with an
+  "(edited)" marker. But deletions aren't (there's no `MESSAGE_DELETE`
+  listener), and an edit to a message the client never rendered in the
+  first place (outside the last-50 replay window, or made while
+  disconnected, since `catch_up`'s REST call only fetches messages
+  *after* the last-seen ID, not edits to older ones already recorded)
+  falls back to appearing as a new entry rather than updating anything.
 - **Attachments are linked, not proxied** — images/files point directly
   at Discord's CDN URLs, which are time-limited signed URLs; fine for
   live viewing, but a link shared later may expire.

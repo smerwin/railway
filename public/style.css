@@ -92,6 +92,11 @@ main {
   color: var(--text-muted);
 }
 
+.edited-marker {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .content {
   margin: 2px 0 0;
   white-space: pre-wrap;

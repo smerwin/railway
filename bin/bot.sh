@@ -23,10 +23,13 @@ touch "$MESSAGES_FILE"
 
 # jq function mapping one raw Discord message object to the shape the
 # front-end expects. Shared (as inlined text) between the REST catch-up
-# path and the live Gateway dispatch path below.
+# path and the live Gateway dispatch path below. Takes the record "kind"
+# (create/update) as a parameter so the front-end can tell an edit from a
+# brand-new message without a separate schema.
 read -r -d '' TO_FEED_MESSAGE_DEF <<'JQ'
-def to_feed_message:
+def to_feed_message(kind):
   {
+    kind: kind,
     id: .id,
     authorId: .author.id,
     authorName: (.member.nick // .author.global_name // .author.username // "Unknown"),
@@ -39,6 +42,7 @@ def to_feed_message:
     ),
     content: .content,
     createdAt: .timestamp,
+    editedAt: (.edited_timestamp // null),
     attachments: [.attachments[] | {url: .url, name: .filename, contentType: .content_type}]
   };
 JQ
@@ -67,7 +71,7 @@ catch_up() {
   if [ "$count" != "0" ]; then
     echo "$response" | jq -c "
       ${TO_FEED_MESSAGE_DEF}
-      reverse | .[] | select(.author.bot != true) | to_feed_message
+      reverse | .[] | select(.author.bot != true) | to_feed_message(\"create\")
     " >> "$MESSAGES_FILE"
     after="$(echo "$response" | jq -r '.[0].id')"
     echo "$after" > "$STATE_FILE"
@@ -77,10 +81,20 @@ catch_up() {
 echo "bot: catch-up on channel ${DISCORD_CHANNEL_ID}" >&2
 catch_up
 
+# Diagnostic only: a plain HTTPS request to the same host websocat is
+# about to connect to, logged so a persistent Gateway connection failure
+# (as opposed to an occasional blip) can be told apart from "this host is
+# unreachable from here at all" vs. "something specific to the WebSocket
+# upgrade/TLS handshake websocat performs." curl reaching Discord's REST
+# API doesn't prove this host is reachable too -- it's a different
+# hostname/edge.
+gw_probe_code="$(curl -sS --http1.1 --max-time 5 -o /dev/null -w '%{http_code}' "https://gateway.discord.gg/?v=10&encoding=json" 2>&1)"
+echo "bot: pre-flight HTTPS check to gateway.discord.gg: ${gw_probe_code}" >&2
+
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
-coproc GW { exec websocat -B 1000000 "$GATEWAY_URL"; }
+coproc GW { exec websocat -v -B 1000000 "$GATEWAY_URL"; }
 
 cleanup() {
   [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
@@ -130,7 +144,7 @@ while IFS= read -r -u "${GW[0]}" line; do
   case "$op" in
     0)
       t="$(echo "$line" | jq -r '.t')"
-      if [ "$t" = "MESSAGE_CREATE" ]; then
+      if [ "$t" = "MESSAGE_CREATE" ] || [ "$t" = "MESSAGE_UPDATE" ]; then
         # Intents subscribe to every channel in every guild the bot can
         # see, not just ours -- Discord has no per-channel Gateway
         # subscription, so the channel filter has to happen here.
@@ -138,10 +152,21 @@ while IFS= read -r -u "${GW[0]}" line; do
         if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
           msg_id="$(echo "$line" | jq -r '.d.id')"
           is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
-          if [ "$is_bot" != "true" ]; then
-            echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message" >> "$MESSAGES_FILE"
+          # MESSAGE_UPDATE can arrive as a partial payload (e.g. Discord
+          # generating a link-preview embed touches no text) -- .content
+          # missing/null means there's no text edit to show, so skip it.
+          has_content="$(echo "$line" | jq -r '.d.content != null')"
+          if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
+            if [ "$t" = "MESSAGE_CREATE" ]; then
+              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"create\")" >> "$MESSAGES_FILE"
+            else
+              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"update\")" >> "$MESSAGES_FILE"
+            fi
           fi
-          echo "$msg_id" > "$STATE_FILE"
+          # Edits reuse the original message's ID, which is always <= the
+          # newest ID we've already recorded -- only creates should ever
+          # advance the REST catch-up cursor.
+          [ "$t" = "MESSAGE_CREATE" ] && echo "$msg_id" > "$STATE_FILE"
         fi
       elif [ "$t" = "READY" ]; then
         echo "bot: session ready" >&2
