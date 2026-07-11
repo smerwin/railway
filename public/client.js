@@ -94,6 +94,12 @@
     return true;
   }
 
+  function removeMessage(id) {
+    const article = messagesEl.querySelector(`[data-message-id="${id}"]`);
+    if (article) article.remove();
+    if (!messagesEl.querySelector('.message')) showEmptyState();
+  }
+
   showEmptyState();
 
   // Every (re)connection to /events replays the last 50 messages from
@@ -115,6 +121,17 @@
     source.addEventListener('error', () => setStatus('disconnected', 'Reconnecting…'));
     source.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
+
+      if (msg.kind === 'delete') {
+        // Deliberately not removing msg.id from renderedIds: if this
+        // delete is later replayed after an SSE reconnect (along with
+        // the original create, both inside the last-50 window), leaving
+        // the ID marked "seen" means the replayed create is skipped
+        // entirely instead of flashing back in right before the
+        // replayed delete removes it again.
+        removeMessage(msg.id);
+        return;
+      }
 
       if (msg.kind === 'update') {
         // Re-applying an edit that was already applied (e.g. replayed

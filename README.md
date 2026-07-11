@@ -48,9 +48,13 @@ Everything runs as two shell scripts inside one container:
    - sends an `Identify` payload with the bot token and intents,
    - runs a background loop that sends a heartbeat on that interval,
    - and reads dispatch events in the foreground, picking out
-     `MESSAGE_CREATE` events, reshaping each with `jq` into a small JSON
-     object (author, avatar URL, content, timestamp, attachments), and
-     appending it as one line to `data/messages.jsonl`.
+     `MESSAGE_CREATE`, `MESSAGE_UPDATE` (edits), and `MESSAGE_DELETE`
+     events for our channel. Creates and updates get reshaped with `jq`
+     into a small JSON object (author, avatar URL, content, timestamp,
+     attachments) tagged with a `kind`; deletes — whose Gateway payload
+     is just `{id, channel_id}`, nothing else — become a bare
+     `{"kind":"delete","id":...}`. Each becomes one line appended to
+     `data/messages.jsonl`.
 
    Before connecting (and again after every reconnect), it does one REST
    catch-up call — `GET /channels/{id}/messages?after=<last-seen-id>` —
@@ -288,15 +292,19 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 - **One hard-coded channel**, and **no auth** on the front-end — anyone
   with the URL can view the feed. Both fine for a demo on a throwaway
   test channel, not for a private/production channel.
-- **Message deletes aren't handled.** `MESSAGE_UPDATE` (edits) is now
-  handled live — the client finds the existing rendered message by
-  Discord's message ID and updates its content in place, with an
-  "(edited)" marker. But deletions aren't (there's no `MESSAGE_DELETE`
-  listener), and an edit to a message the client never rendered in the
-  first place (outside the last-50 replay window, or made while
-  disconnected, since `catch_up`'s REST call only fetches messages
-  *after* the last-seen ID, not edits to older ones already recorded)
-  falls back to appearing as a new entry rather than updating anything.
+- **Live edits and deletes are handled; ones missed while disconnected
+  aren't.** `MESSAGE_UPDATE` and `MESSAGE_DELETE` both update the DOM in
+  place by looking up the existing message via its Discord message ID
+  (`(edited)` marker for updates, removal for deletes). But `catch_up`'s
+  REST call only fetches messages *after* the last-seen ID — it has no
+  way to learn that an older, already-recorded message was edited or
+  deleted while the bot was disconnected, since Discord's message-list
+  endpoint doesn't surface a "deleted" state at all, and only returns a
+  message's *current* content, not a diff. An edit/delete of a message
+  the client never rendered in the first place (outside the last-50
+  replay window) is a no-op for a delete, and falls back to appearing as
+  a new entry for an edit — better than silently dropping it, but not
+  fully correct either.
 - **Attachments are linked, not proxied** — images/files point directly
   at Discord's CDN URLs, which are time-limited signed URLs; fine for
   live viewing, but a link shared later may expire.

@@ -168,6 +168,15 @@ while IFS= read -r -u "${GW[0]}" line; do
           # advance the REST catch-up cursor.
           [ "$t" = "MESSAGE_CREATE" ] && echo "$msg_id" > "$STATE_FILE"
         fi
+      elif [ "$t" = "MESSAGE_DELETE" ]; then
+        # MESSAGE_DELETE's payload is just {id, channel_id[, guild_id]}
+        # -- no author, no content -- so it can't share the create/update
+        # path above at all; there's nothing to filter by author/content,
+        # only by channel.
+        channel_id="$(echo "$line" | jq -r '.d.channel_id')"
+        if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
+          echo "$line" | jq -c '{kind: "delete", id: .d.id}' >> "$MESSAGES_FILE"
+        fi
       elif [ "$t" = "READY" ]; then
         echo "bot: session ready" >&2
       fi
