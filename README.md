@@ -236,10 +236,11 @@ timer, an Identify payload) rather than WebSocket itself. That's what
 
 ## Known limitations
 
-- **Open issue: the Discord Gateway connection doesn't survive long
-  enough to become a stable session.** This one went through a few
-  rounds of hypotheses as more evidence came in, worth recording since
-  none of the earlier ones panned out cleanly:
+- **Resolved: the Discord Gateway connection didn't survive long enough
+  to become a stable session.** Root cause turned out to be a single
+  whitespace character in a config value, not a bug in this codebase —
+  but it took a long chain of hypotheses to get there, worth recording
+  in full since most of them didn't pan out:
 
   1. Initial deploy logs showed `websocat: WebSocketError: I/O failure`
      with no detail. Adding `websocat -v` revealed the real picture: TCP
@@ -315,20 +316,35 @@ timer, an Identify payload) rather than WebSocket itself. That's what
      sends and got back a complete, successful session (`READY` as the
      bot user, a real `GUILD_CREATE` for the target server).
 
-  Conclusion: every application-level variable (token, intents, rate
-  limit, payload shape, client library) has been tested and eliminated.
-  The one remaining difference between a working session and a failing
-  one is the network it originates from. This points at Railway's
-  shared egress IP range specifically being rejected by Discord at
-  session-creation time — which fits the observed shape of the failure
-  (the WS handshake and `Hello` succeed fine even from Railway, since
-  that doesn't touch session state; the close consistently happens right
-  at `Identify`, the first point where Discord's backend would actually
-  create one). This isn't something fixable in this codebase; it's a
-  network-level property of the hosting platform. The path forward, if
-  pursued, is on Railway's side (a static/dedicated egress IP, if
-  available, on the chance it's allocated from a cleaner pool) rather
-  than anything in `bot.sh`.
+  8. Point 7 left the network as the only remaining variable, by
+     elimination — every application-level thing (token, intents, rate
+     limit, payload shape, client library) had been tested and cleared.
+     That reasoning was sound, but the elimination itself had a gap: a
+     small diagnostic script logging the token's exact length, before
+     and after trimming, without ever printing the token itself, found
+     it — 73 characters raw, 72 trimmed. One stray whitespace character
+     in Railway's `DISCORD_BOT_TOKEN` value. REST calls tolerated it
+     silently (an HTTP `Authorization` header, commonly trimmed by
+     servers); the Gateway's `Identify` didn't (a raw JSON string,
+     compared byte-for-byte) — which is exactly the REST-succeeds/
+     Gateway-fails asymmetry that had been the central puzzle since
+     point 4, and exactly why `websocat` failed identically to real
+     Node/`ws` once tested with the actual production token: both were
+     sending the same corrupted string.
+
+  Actual resolution: `bot.sh` now trims `DISCORD_BOT_TOKEN` before using
+  it (pure bash parameter expansion, no subshell). Every network-level
+  theory in this section — Cloudflare bot-management, IP reputation,
+  Railway's egress range — was a red herring. The entire investigation,
+  start to finish, was chasing a config data-entry error: one whitespace
+  character, pasted into a dashboard text field, invisible there,
+  silently tolerated by every REST call this bot made, and fatal to
+  every single Gateway connection attempt.
+
+  A brief apology to Railway's network team: a large fraction of this
+  document accused your shared egress IP range of being reputation-
+  flagged, rate-limited, or otherwise unwelcome at Discord's door. It
+  was never your network. It was whitespace. Sorry.
 
   Several fixes from earlier rounds of this investigation remain
   worthwhile regardless: `run.sh` backs off exponentially (3s → 60s cap,
