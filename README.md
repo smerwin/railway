@@ -249,11 +249,20 @@ timer, an Identify payload) rather than WebSocket itself. That's what
   Cloudflare-fronted Gateway edge with a fresh reconnect every 3 seconds
   indefinitely — a pattern that plausibly earns a temporary rate-limit
   or soft-block, and continuing to hammer it wouldn't let any such block
-  clear. Two changes address this without being certain it's the whole
-  story: `run.sh` now backs off exponentially (3s → 60s cap) on fast
-  failures and resets once a connection lasts 30s+, and `bot.sh` sends a
-  descriptive `User-Agent` header on the Gateway handshake in case
-  Cloudflare's bot-detection heuristics are a factor too.
+  clear. `run.sh` now backs off exponentially (3s → 60s cap) on fast
+  failures and resets once a connection lasts 30s+, without being
+  certain that's the whole story.
+
+  A descriptive `User-Agent` header on the Gateway handshake was also
+  tried, on the theory that Cloudflare's bot-detection heuristics might
+  be a factor — but `websocat -H` turned out to have a parsing gotcha
+  (its docs warn the space-separated form can greedily consume the next
+  argument too, and it did: it ate `$GATEWAY_URL`, briefly breaking the
+  connection entirely with "No URL specified"). With no working
+  `websocat` binary in this environment to verify the fix against
+  directly, and the User-Agent theory being speculative to begin with,
+  it was dropped rather than risk a second blind guess at the correct
+  flag syntax.
 
   Separately — and this is the part that explains "messages take minutes
   to show up" specifically — the `Date:` header timestamps embedded in
@@ -270,8 +279,8 @@ timer, an Identify payload) rather than WebSocket itself. That's what
   `websocat` itself would've taken to notice and exit.
 
   Unresolved as of this writing: *why* Discord closes the connection
-  before `Hello` in the first place. If the backoff + `User-Agent`
-  changes don't resolve it, the `-v` output is the next place to look.
+  before `Hello` in the first place. If the backoff change doesn't
+  resolve it, the `-v` output is the next place to look.
 - **No session Resume.** Real Discord clients reconnect with a `Resume`
   (op 6) using the last session ID + sequence number, replaying only
   what was missed. This bot doesn't implement that: every reconnect is a

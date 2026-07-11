@@ -94,7 +94,15 @@ echo "bot: pre-flight HTTPS check to gateway.discord.gg: ${gw_probe_code}" >&2
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
-coproc GW { exec websocat -v -B 1000000 -H "User-Agent: DiscordBot (https://github.com/smerwin/railway, 1.0)" "$GATEWAY_URL"; }
+# A custom User-Agent header (-H) was tried here as a hypothesis-driven
+# fix for the Gateway closing connections before Hello, but there's no
+# working websocat binary in this environment to verify its -H argument
+# parsing against (it briefly caused "No URL specified" -- the flag ate
+# $GATEWAY_URL). Dropped rather than guess a second time at syntax that
+# can't be tested locally; the User-Agent theory was speculative to
+# begin with, unlike the backoff fix in run.sh, which is grounded in the
+# actual observed close-before-Hello pattern.
+coproc GW { exec websocat -v -B 1000000 "$GATEWAY_URL"; }
 
 cleanup() {
   [ -n "${HEARTBEAT_PID:-}" ] && kill "$HEARTBEAT_PID" 2>/dev/null
