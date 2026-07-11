@@ -2,9 +2,6 @@
 .env*.local
 .env
 
-# diagnostic/ is a temporary Node script (see its own comment header)
-/diagnostic/node_modules
-
 # runtime data (message history / poll cursor)
 /data/*
 !/data/.gitkeep

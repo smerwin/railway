@@ -1,8 +1,0 @@
-{
-  "name": "gateway-diagnostic",
-  "private": true,
-  "description": "Temporary diagnostic script, not part of the application. See check_gateway.js.",
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
-}

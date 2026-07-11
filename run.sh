@@ -9,14 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID}"
 : "${PORT:=3000}"
 
-# TEMPORARY: one-shot diagnostic (see diagnostic/check_gateway.js and the
-# README's "Open issue" section) checking whether a Node/ws client
-# behaves differently from websocat when run from Railway specifically.
-# Backgrounded so it can't delay the web server coming up; remove this
-# block, the diagnostic/ directory, and the Dockerfile's nodejs/npm
-# install together once answered.
-( node "$SCRIPT_DIR/diagnostic/check_gateway.js" 2>&1 ) &
-
 (
   backoff=3
   while true; do

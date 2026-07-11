@@ -90,39 +90,9 @@ catch_up() {
 echo "bot: catch-up on channel ${DISCORD_CHANNEL_ID}" >&2
 catch_up
 
-# Diagnostic only: a plain HTTPS request to the same host websocat is
-# about to connect to, logged so a persistent Gateway connection failure
-# (as opposed to an occasional blip) can be told apart from "this host is
-# unreachable from here at all" vs. "something specific to the WebSocket
-# upgrade/TLS handshake websocat performs." curl reaching Discord's REST
-# API doesn't prove this host is reachable too -- it's a different
-# hostname/edge.
-gw_probe_code="$(curl -sS --http1.1 --max-time 5 -o /dev/null -w '%{http_code}' "https://gateway.discord.gg/?v=10&encoding=json" 2>&1)"
-echo "bot: pre-flight HTTPS check to gateway.discord.gg: ${gw_probe_code}" >&2
-
-# Diagnostic: Discord's own accounting of this bot token's remaining
-# Identify budget (documented as 1000/day, resetting on a rolling
-# window). If the connection is dying right after Identify with no
-# further response -- no Ready, no Invalid Session, nothing -- and
-# "remaining" here is 0 or very low, that's a directly-checkable
-# explanation, rather than continuing to guess: the earlier fixed
-# 3-second retry loop (before backoff was added) may have burned through
-# this token's daily Identify budget by reconnecting that aggressively
-# for an extended period.
-session_limit_info="$(curl -sS --http1.1 --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "https://discord.com/api/v10/gateway/bot" 2>&1)"
-echo "bot: session_start_limit: $(echo "$session_limit_info" | jq -c '.session_start_limit // .' 2>/dev/null)" >&2
-
 echo "bot: connecting to Discord Gateway" >&2
 echo "null" > "$SEQ_FILE"
 
-# A custom User-Agent header (-H) was tried here as a hypothesis-driven
-# fix for the Gateway closing connections before Hello, but there's no
-# working websocat binary in this environment to verify its -H argument
-# parsing against (it briefly caused "No URL specified" -- the flag ate
-# $GATEWAY_URL). Dropped rather than guess a second time at syntax that
-# can't be tested locally; the User-Agent theory was speculative to
-# begin with, unlike the backoff fix in run.sh, which is grounded in the
-# actual observed close-before-Hello pattern.
 coproc GW { exec websocat -v -B 1000000 "$GATEWAY_URL"; }
 
 cleanup() {
@@ -149,13 +119,11 @@ if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
 interval_sec="$(awk "BEGIN { printf \"%.3f\", ${interval_ms}/1000 }")"
-echo "bot: got Hello, heartbeat_interval=${interval_ms}ms (${interval_sec}s)" >&2
 
 identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS" '
   {op: 2, d: {token: $token, intents: $intents, properties: {os: "linux", browser: "bash-discord-bot", device: "bash-discord-bot"}}}
 ')"
 printf '%s\n' "$identify" >&"${GW[1]}"
-echo "bot: sent Identify" >&2
 
 # Heartbeat loop: runs as a background job writing to the coproc's stdin
 # on a timer. Bash closes a coprocess's file descriptors in forked child
@@ -170,12 +138,7 @@ exec 70>&"${GW[1]}"
   while true; do
     sleep "$interval_sec"
     seq="$(cat "$SEQ_FILE")"
-    if { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null; then
-      echo "bot: sent heartbeat (seq=${seq})" >&2
-    else
-      echo "bot: heartbeat write failed (coproc pipe closed), stopping heartbeat loop" >&2
-      exit 0
-    fi
+    { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null || exit 0
   done
 ) &
 HEARTBEAT_PID=$!
@@ -187,8 +150,6 @@ HEARTBEAT_PID=$!
 while IFS= read -r -u "${GW[0]}" line; do
   op="$(echo "$line" | jq -r '.op')"
   seq="$(echo "$line" | jq -r '.s // empty')"
-  dispatch_t="$(echo "$line" | jq -r '.t // empty')"
-  echo "bot: recv op=${op}${dispatch_t:+ t=$dispatch_t}${seq:+ seq=$seq}" >&2
   [ -n "$seq" ] && echo "$seq" > "$SEQ_FILE"
 
   case "$op" in
