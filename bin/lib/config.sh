@@ -8,5 +8,8 @@ MESSAGES_FILE="$DATA_DIR/messages.jsonl"
 STATE_FILE="$DATA_DIR/last_id"
 
 : "${PORT:=3000}"
+: "${LOG_ROTATE_MAX_BYTES:=5242880}"   # 5MiB
+: "${LOG_ROTATE_INTERVAL_SEC:=60}"
+: "${LOG_ROTATE_KEEP:=5}"
 
 mkdir -p "$DATA_DIR"
