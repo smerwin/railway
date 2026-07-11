@@ -118,30 +118,88 @@ if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
   exit 1
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
-interval_sec="$(awk "BEGIN { printf \"%.3f\", ${interval_ms}/1000 }")"
+interval_sec="$(awk -v ms="$interval_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
 
 identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS" '
   {op: 2, d: {token: $token, intents: $intents, properties: {os: "linux", browser: "bash-discord-bot", device: "bash-discord-bot"}}}
 ')"
 printf '%s\n' "$identify" >&"${GW[1]}"
 
-# Heartbeat loop: runs as a background job writing to the coproc's stdin
-# on a timer. Bash closes a coprocess's file descriptors in forked child
-# processes (a documented bash limitation, not something specific to
-# this script), so ${GW[1]} itself is unusable from a backgrounded job --
-# it has to be explicitly duplicated to a fixed fd *before* backgrounding.
-# The sequence number is read from a file rather than a shared variable,
-# since the heartbeat job is a separate process from the main dispatch
-# loop below.
+# Bash closes a coprocess's file descriptors in forked child processes
+# (a documented bash limitation, not something specific to this script),
+# so ${GW[1]} itself is unusable from a backgrounded job -- it has to be
+# explicitly duplicated to a fixed fd *before* backgrounding anything.
 exec 70>&"${GW[1]}"
+
+send_heartbeat() {
+  local seq
+  seq="$(cat "$SEQ_FILE")"
+  printf '{"op":1,"d":%s}\n' "$seq" >&70
+}
+
+# Heartbeat loop: runs as a background job so it can fire on its own
+# timer without blocking the main dispatch loop below. The sequence
+# number is read from a file rather than a shared variable, since this
+# is a separate process from that loop.
 (
   while true; do
     sleep "$interval_sec"
-    seq="$(cat "$SEQ_FILE")"
-    { printf '{"op":1,"d":%s}\n' "$seq" >&70; } 2>/dev/null || exit 0
+    { send_heartbeat; } 2>/dev/null || exit 0
   done
 ) &
 HEARTBEAT_PID=$!
+
+# Intents subscribe to every channel in every guild the bot can see, not
+# just ours -- Discord has no per-channel Gateway subscription, so both
+# handlers below filter by channel themselves before doing anything else.
+handle_message_upsert() {
+  local line="$1" t="$2"
+  local channel_id
+  channel_id="$(echo "$line" | jq -r '.d.channel_id')"
+  [ "$channel_id" = "$DISCORD_CHANNEL_ID" ] || return 0
+
+  local msg_id is_bot has_content kind
+  msg_id="$(echo "$line" | jq -r '.d.id')"
+  is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
+  # MESSAGE_UPDATE can arrive as a partial payload (e.g. Discord
+  # generating a link-preview embed touches no text) -- .content
+  # missing/null means there's no text edit to show, so skip it.
+  has_content="$(echo "$line" | jq -r '.d.content != null')"
+
+  if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
+    kind="create"
+    [ "$t" = "MESSAGE_UPDATE" ] && kind="update"
+    echo "$line" | jq -c --arg kind "$kind" "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\$kind)" >> "$MESSAGES_FILE"
+  fi
+
+  # Edits reuse the original message's ID, which is always <= the newest
+  # ID we've already recorded -- only creates should ever advance the
+  # REST catch-up cursor.
+  [ "$t" = "MESSAGE_CREATE" ] && echo "$msg_id" > "$STATE_FILE"
+}
+
+# MESSAGE_DELETE's payload is just {id, channel_id[, guild_id]} -- no
+# author, no content -- so it can't share handle_message_upsert at all;
+# there's nothing to filter by author/content, only by channel.
+handle_message_delete() {
+  local line="$1"
+  local channel_id
+  channel_id="$(echo "$line" | jq -r '.d.channel_id')"
+  [ "$channel_id" = "$DISCORD_CHANNEL_ID" ] || return 0
+
+  echo "$line" | jq -c '{kind: "delete", id: .d.id}' >> "$MESSAGES_FILE"
+}
+
+# Handles a single op:0 (Dispatch) frame, routing by its .t event type.
+handle_dispatch() {
+  local line="$1" t
+  t="$(echo "$line" | jq -r '.t')"
+  case "$t" in
+    MESSAGE_CREATE | MESSAGE_UPDATE) handle_message_upsert "$line" "$t" ;;
+    MESSAGE_DELETE) handle_message_delete "$line" ;;
+    READY) echo "bot: session ready" >&2 ;;
+  esac
+}
 
 # Main dispatch loop. No session Resume is implemented: on Reconnect (op
 # 7), Invalid Session (op 9), or the socket just closing, this loop exits
@@ -153,45 +211,8 @@ while IFS= read -r -u "${GW[0]}" line; do
   [ -n "$seq" ] && echo "$seq" > "$SEQ_FILE"
 
   case "$op" in
-    0)
-      t="$(echo "$line" | jq -r '.t')"
-      if [ "$t" = "MESSAGE_CREATE" ] || [ "$t" = "MESSAGE_UPDATE" ]; then
-        # Intents subscribe to every channel in every guild the bot can
-        # see, not just ours -- Discord has no per-channel Gateway
-        # subscription, so the channel filter has to happen here.
-        channel_id="$(echo "$line" | jq -r '.d.channel_id')"
-        if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
-          msg_id="$(echo "$line" | jq -r '.d.id')"
-          is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
-          # MESSAGE_UPDATE can arrive as a partial payload (e.g. Discord
-          # generating a link-preview embed touches no text) -- .content
-          # missing/null means there's no text edit to show, so skip it.
-          has_content="$(echo "$line" | jq -r '.d.content != null')"
-          if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
-            if [ "$t" = "MESSAGE_CREATE" ]; then
-              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"create\")" >> "$MESSAGES_FILE"
-            else
-              echo "$line" | jq -c "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\"update\")" >> "$MESSAGES_FILE"
-            fi
-          fi
-          # Edits reuse the original message's ID, which is always <= the
-          # newest ID we've already recorded -- only creates should ever
-          # advance the REST catch-up cursor.
-          [ "$t" = "MESSAGE_CREATE" ] && echo "$msg_id" > "$STATE_FILE"
-        fi
-      elif [ "$t" = "MESSAGE_DELETE" ]; then
-        # MESSAGE_DELETE's payload is just {id, channel_id[, guild_id]}
-        # -- no author, no content -- so it can't share the create/update
-        # path above at all; there's nothing to filter by author/content,
-        # only by channel.
-        channel_id="$(echo "$line" | jq -r '.d.channel_id')"
-        if [ "$channel_id" = "$DISCORD_CHANNEL_ID" ]; then
-          echo "$line" | jq -c '{kind: "delete", id: .d.id}' >> "$MESSAGES_FILE"
-        fi
-      elif [ "$t" = "READY" ]; then
-        echo "bot: session ready" >&2
-      fi
-      ;;
+    0) handle_dispatch "$line" ;;
+    1) { send_heartbeat; } 2>/dev/null ;; # Discord can ask for an out-of-band heartbeat
     7)
       echo "bot: server requested reconnect" >&2
       break
