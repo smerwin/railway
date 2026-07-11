@@ -12,6 +12,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/config.sh"
 : "${DISCORD_BOT_TOKEN:?Set DISCORD_BOT_TOKEN}"
 : "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID}"
 
+# Defensive: strip any leading/trailing whitespace picked up from however
+# the variable was set (e.g. a trailing newline pasted into a dashboard).
+# REST calls embed the token in an HTTP header, which servers commonly
+# trim -- but the Gateway Identify embeds it as a raw JSON string value,
+# compared byte-for-byte, where stray whitespace would silently break
+# authentication while REST calls using the same variable kept working.
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN#"${DISCORD_BOT_TOKEN%%[![:space:]]*}"}"
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN%"${DISCORD_BOT_TOKEN##*[![:space:]]}"}"
+
 API="https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages"
 GATEWAY_URL="wss://gateway.discord.gg/?v=10&encoding=json"
 # GUILDS (1<<0) + GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15)

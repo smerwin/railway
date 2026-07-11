@@ -12,6 +12,17 @@ if (!TOKEN) {
   process.exit(0);
 }
 
+// Checking for stray whitespace without ever logging the token itself:
+// REST calls embed it in an HTTP header (commonly trimmed by servers),
+// but the Gateway Identify embeds it as a raw JSON string value (compared
+// byte-for-byte, not trimmed) -- exactly the kind of corruption that
+// would explain REST succeeding while every Gateway Identify fails.
+console.log(
+  `diagnostic: token length=${TOKEN.length}, trimmed length=${TOKEN.trim().length}, ` +
+  `has_leading_or_trailing_whitespace=${TOKEN !== TOKEN.trim()}`
+);
+const CLEAN_TOKEN = TOKEN.trim();
+
 const INTENTS = 33281; // GUILDS(1) + GUILD_MESSAGES(512) + MESSAGE_CONTENT(32768)
 const ws = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
 let heartbeatTimer;
@@ -39,12 +50,12 @@ ws.on('message', (data) => {
     ws.send(JSON.stringify({
       op: 2,
       d: {
-        token: TOKEN,
+        token: CLEAN_TOKEN,
         intents: INTENTS,
         properties: { os: 'linux', browser: 'bash-discord-bot', device: 'bash-discord-bot' },
       },
     }));
-    console.log('diagnostic: sent Identify');
+    console.log('diagnostic: sent Identify (trimmed token)');
   }
 
   if (msg.op === 0 && msg.t === 'READY') {
