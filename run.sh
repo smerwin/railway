@@ -32,5 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   done
 ) &
 
+"$SCRIPT_DIR/bin/rotate_logs.sh" &
+
 echo "run.sh: web server listening on port $PORT"
 exec socat TCP-LISTEN:"$PORT",fork,reuseaddr EXEC:"$SCRIPT_DIR/bin/handle_request.sh"

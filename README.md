@@ -236,10 +236,39 @@ at all.
   reconnects automatically on any dropped connection, so that replay can
   happen mid-session too. `client.js` dedupes by message ID to avoid
   rendering the backlog twice.
-- **No log rotation.** `data/messages.jsonl` grows forever. An earlier
-  version trimmed it, which caused the duplicate-message bug described
-  above — a production version would need rotation that doesn't fight
-  `tail -F`, or history storage outside a flat file.
+- **Log rotation, by size, using copytruncate.** [`bin/rotate_logs.sh`](bin/rotate_logs.sh)
+  runs alongside the bot and web server. Every `LOG_ROTATE_INTERVAL_SEC`
+  (default 60s) it checks `messages.jsonl`'s size, and once it crosses
+  `LOG_ROTATE_MAX_BYTES` (default 5MiB) it copies the file to
+  `messages.jsonl.<UTC timestamp>`, then truncates `messages.jsonl` to
+  empty *in place* — same path, same inode — keeping the newest
+  `LOG_ROTATE_KEEP` (default 5) archives and deleting older ones. Two
+  designs were tried and rejected before this one, both instructive:
+    - Trimming with `tail -n N | mv` (an actual earlier version) replaces
+      the file with a new, non-empty one at the same path. `tail -F` in
+      `handle_request.sh` reads that as a brand-new file and replays its
+      contents to already-connected SSE clients as if they were new
+      messages — the duplicate-message bug described above.
+    - Renaming the file away with nothing replacing it (tried while
+      building this script) avoids that replay, but has the same failure
+      class from the other direction: `tail -F`, on noticing its watched
+      path got replaced, reopens and resumes from the new file's
+      *current* size rather than from its start. Any lines written to the
+      recreated file before tail got around to reopening it were silently
+      dropped from the live stream — verified by testing to lose whole
+      batches of messages under realistic write timing, not a rare edge
+      case.
+
+  Truncating in place sidesteps both: `tail -F` never reopens anything, so
+  its ordinary truncation handling ("the file got smaller, keep reading
+  forward from the new size") is what fires, with no reconnect-like reset.
+  The one remaining trade-off — standard for copytruncate, e.g. what
+  nginx/rsyslog default to — is a narrow race: a line written in the gap
+  between the copy finishing and the truncate landing can be skipped by
+  whichever SSE clients are attached at that instant. Verified by testing
+  (realistic, spaced write timing across a rotation) to cost at most the
+  single message straddling that instant, never a batch, and it's
+  preserved in the archive on disk either way.
 - **No persistence across restarts/redeploys.** `data/` is plain
   container-local disk. A redeploy or crash loses history (the bot
   resumes live-streaming via REST catch-up, so it won't re-flood
