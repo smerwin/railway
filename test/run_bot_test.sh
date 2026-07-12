@@ -47,6 +47,14 @@ check_eq() {
   fi
 }
 
+# Counts records of a given kind/id in messages.jsonl. --arg (not string
+# interpolation) so kind/id never have to be jq-quoted by hand here.
+count_records() {
+  local kind="$1" id="$2"
+  jq -c --arg kind "$kind" --arg id "$id" \
+    'select(.kind == $kind and .id == $id)' "$messages_file" | wc -l | tr -d ' '
+}
+
 if [ ! -f "$messages_file" ]; then
   fail "messages.jsonl was created"
   echo "--- bot.sh output ---" >&2
@@ -63,10 +71,8 @@ else
 fi
 
 # --- Creates: exactly one create record each for 555 and 557. ---
-check_eq "one create record for message 555" \
-  "$(jq -c 'select(.kind == "create" and .id == "555")' "$messages_file" | wc -l | tr -d ' ')" "1"
-check_eq "one create record for message 557 (with nick/avatar/attachment)" \
-  "$(jq -c 'select(.kind == "create" and .id == "557")' "$messages_file" | wc -l | tr -d ' ')" "1"
+check_eq "one create record for message 555" "$(count_records create 555)" "1"
+check_eq "one create record for message 557 (with nick/avatar/attachment)" "$(count_records create 557)" "1"
 check_eq "message 557's author name resolves from member nick" \
   "$(jq -r 'select(.id == "557") | .authorName' "$messages_file" | head -1)" "Nicky"
 check_eq "multi-line content is preserved on one JSONL line" \
@@ -76,15 +82,13 @@ content"
 
 # --- Updates: exactly one update record for 555 (the partial update with
 # no content must be skipped, not produce a second, blank-content record). ---
-check_eq "exactly one update record for message 555 (partial update skipped)" \
-  "$(jq -c 'select(.kind == "update" and .id == "555")' "$messages_file" | wc -l | tr -d ' ')" "1"
+check_eq "exactly one update record for message 555 (partial update skipped)" "$(count_records update 555)" "1"
 check_eq "the update carries the edited content" \
   "$(jq -r 'select(.kind == "update" and .id == "555") | .content' "$messages_file")" \
   "hello from gateway (edited!)"
 
 # --- Deletes: exactly one delete record for 557. ---
-check_eq "exactly one delete record for message 557" \
-  "$(jq -c 'select(.kind == "delete" and .id == "557")' "$messages_file" | wc -l | tr -d ' ')" "1"
+check_eq "exactly one delete record for message 557" "$(count_records delete 557)" "1"
 
 # --- last_id only advances on creates, never on the update/delete that
 # follow it (both reference earlier, lower/equal IDs). ---

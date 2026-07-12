@@ -44,6 +44,12 @@ touch "$MESSAGES_FILE"
 # can be run and tested on its own, independent of bot.sh.
 TO_FEED_MESSAGE_JQ="$LIB_DIR/to_feed_message.jq"
 
+# Shorthand for the "pipe one JSON value through a jq filter" pattern that
+# shows up throughout this file (Gateway frames, REST responses, etc).
+jval() {
+  echo "$1" | jq -r "$2"
+}
+
 # Fetches anything posted after the last message ID we've persisted.
 # Doubles as the initial history backfill on first-ever start (after=0)
 # and as the gap-filler after every Gateway reconnect.
@@ -65,14 +71,14 @@ catch_up() {
   [ -z "$response" ] && return 0
 
   if ! echo "$response" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    echo "bot: catch-up REST error: $(echo "$response" | jq -r '.message // "unknown"' 2>/dev/null)" >&2
+    echo "bot: catch-up REST error: $(jval "$response" '.message // "unknown"' 2>/dev/null)" >&2
     return 0
   fi
 
   count="$(echo "$response" | jq 'length')"
   if [ "$count" != "0" ]; then
     echo "$response" | jq -c -f "$TO_FEED_MESSAGE_JQ" --arg kind create --arg mode list >> "$MESSAGES_FILE"
-    after="$(echo "$response" | jq -r '.[0].id')"
+    after="$(jval "$response" '.[0].id')"
     echo "$after" > "$STATE_FILE"
   fi
 }
@@ -107,7 +113,7 @@ if ! IFS= read -r -t "$HELLO_TIMEOUT_SECS" -u "${GW[0]}" hello_line; then
   echo "bot: no Hello received from Gateway within ${HELLO_TIMEOUT_SECS}s, exiting" >&2
   exit 1
 fi
-interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
+interval_ms="$(jval "$hello_line" '.d.heartbeat_interval')"
 interval_sec="$(awk -v ms="$interval_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
 
 identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS" '
@@ -121,11 +127,14 @@ printf '%s\n' "$identify" >&"${GW[1]}"
 # explicitly duplicated to a fixed fd *before* backgrounding anything.
 exec 70>&"${GW[1]}"
 
+# stderr suppressed on the whole function (rather than at each call site):
+# a failed write here just means the coproc pipe is already gone (Discord
+# closed the connection). Both call sites below rely on this to fail quietly.
 send_heartbeat() {
   local seq
   seq="$(cat "$SEQ_FILE")"
   printf '{"op":1,"d":%s}\n' "$seq" >&70
-}
+} 2>/dev/null
 
 # Heartbeat loop: runs as a background job so it can fire on its own
 # timer without blocking the main dispatch loop below. The sequence
@@ -134,11 +143,11 @@ send_heartbeat() {
 (
   while true; do
     sleep "$interval_sec"
-    # A failed write here just means the coproc pipe is already gone
-    # (Discord closed the connection): stop this loop quietly and let
-    # the main dispatch loop below notice the same thing on its own next
-    # read, exit bot.sh, and have run.sh's supervisor restart it.
-    { send_heartbeat; } 2>/dev/null || exit 0
+    # A failed write here means the coproc pipe is already gone (Discord
+    # closed the connection): stop this loop quietly and let the main
+    # dispatch loop below notice the same thing on its own next read,
+    # exit bot.sh, and have run.sh's supervisor restart it.
+    send_heartbeat || exit 0
   done
 ) &
 HEARTBEAT_PID=$!
@@ -147,7 +156,7 @@ HEARTBEAT_PID=$!
 # just ours -- Discord has no per-channel Gateway subscription, so both
 # handlers below filter by channel themselves before doing anything else.
 dispatch_channel_id() {
-  echo "$1" | jq -r '.d.channel_id'
+  jval "$1" '.d.channel_id'
 }
 
 # Returns 1 (and does nothing else) when the dispatch is for a channel
@@ -162,12 +171,12 @@ handle_message_upsert() {
   is_our_channel "$line" || return 0
 
   local msg_id is_bot has_content kind
-  msg_id="$(echo "$line" | jq -r '.d.id')"
-  is_bot="$(echo "$line" | jq -r '.d.author.bot // false')"
+  msg_id="$(jval "$line" '.d.id')"
+  is_bot="$(jval "$line" '.d.author.bot // false')"
   # MESSAGE_UPDATE can arrive as a partial payload (e.g. Discord
   # generating a link-preview embed touches no text) -- .content
   # missing/null means there's no text edit to show, so skip it.
-  has_content="$(echo "$line" | jq -r '.d.content != null')"
+  has_content="$(jval "$line" '.d.content != null')"
 
   if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
     kind="create"
@@ -194,7 +203,7 @@ handle_message_delete() {
 # Handles a single op:0 (Dispatch) frame, routing by its .t event type.
 handle_dispatch() {
   local line="$1" t
-  t="$(echo "$line" | jq -r '.t')"
+  t="$(jval "$line" '.t')"
   case "$t" in
     MESSAGE_CREATE | MESSAGE_UPDATE) handle_message_upsert "$line" "$t" ;;
     MESSAGE_DELETE) handle_message_delete "$line" ;;
@@ -207,13 +216,13 @@ handle_dispatch() {
 # and run.sh's outer supervisor restarts the whole script -- which reruns
 # catch_up to bridge the gap, then re-Identifies for a fresh session.
 while IFS= read -r -u "${GW[0]}" line; do
-  op="$(echo "$line" | jq -r '.op')"
-  seq="$(echo "$line" | jq -r '.s // empty')"
+  op="$(jval "$line" '.op')"
+  seq="$(jval "$line" '.s // empty')"
   [ -n "$seq" ] && echo "$seq" > "$SEQ_FILE"
 
   case "$op" in
     0) handle_dispatch "$line" ;;
-    1) { send_heartbeat; } 2>/dev/null ;; # Discord can ask for an out-of-band heartbeat
+    1) send_heartbeat ;; # Discord can ask for an out-of-band heartbeat
     7)
       echo "bot: server requested reconnect" >&2
       break

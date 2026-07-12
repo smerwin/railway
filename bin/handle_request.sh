@@ -27,22 +27,23 @@ done
 
 send_status() { printf 'HTTP/1.1 %s\r\n' "$1"; }
 
+send_response_headers() {
+  send_status "$1"
+  printf 'Content-Type: %s\r\n' "$2"
+  printf 'Content-Length: %s\r\n' "$3"
+  printf 'Connection: close\r\n\r\n'
+}
+
 serve_file() {
   local file="$1" ctype="$2" length
   length=$(wc -c < "$file")
-  send_status "200 OK"
-  printf 'Content-Type: %s\r\n' "$ctype"
-  printf 'Content-Length: %s\r\n' "$length"
-  printf 'Connection: close\r\n\r\n'
+  send_response_headers "200 OK" "$ctype" "$length"
   cat "$file"
 }
 
 serve_text() {
   local status="$1" body="$2"
-  send_status "$status"
-  printf 'Content-Type: text/plain\r\n'
-  printf 'Content-Length: %s\r\n' "${#body}"
-  printf 'Connection: close\r\n\r\n'
+  send_response_headers "$status" "text/plain" "${#body}"
   printf '%s' "$body"
 }
 

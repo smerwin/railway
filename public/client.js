@@ -12,6 +12,10 @@
     return window.innerHeight + window.scrollY >= document.body.offsetHeight - 100;
   }
 
+  function findMessageEl(id) {
+    return messagesEl.querySelector(`[data-message-id="${id}"]`);
+  }
+
   function clearEmptyState() {
     const empty = messagesEl.querySelector('.empty-state');
     if (empty) empty.remove();
@@ -87,7 +91,7 @@
 
   // Returns true if an existing message was found and updated in place.
   function updateMessage(msg) {
-    const article = messagesEl.querySelector(`[data-message-id="${msg.id}"]`);
+    const article = findMessageEl(msg.id);
     if (!article) return false;
     article.querySelector('.content').textContent = msg.content;
     setEditedMarker(article, msg);
@@ -95,7 +99,7 @@
   }
 
   function removeMessage(id) {
-    const article = messagesEl.querySelector(`[data-message-id="${id}"]`);
+    const article = findMessageEl(id);
     if (article) article.remove();
     if (!messagesEl.querySelector('.message')) showEmptyState();
   }
