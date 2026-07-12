@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Stand-in for the real websocat binary, used only by test/run_bot_test.sh.
+# Emulates enough of the Discord Gateway handshake (Hello, Identify,
+# heartbeats, MESSAGE_CREATE/UPDATE/DELETE dispatches, a server-requested
+# out-of-band heartbeat) to exercise bin/bot.sh's coproc/dispatch logic
+# without a real token or network access to Discord. Ignores all of its
+# own CLI arguments, same as bin/bot.sh's real invocation would pass them.
+: > "$STUB_LOG"
+
+# Duplicate real stdin to fd 9 *before* backgrounding anything -- a
+# backgrounded job's own stdin (fd 0) gets auto-redirected to /dev/null
+# when job control is off (as it is in a non-interactive script), so the
+# reader below must read from the explicitly-duplicated fd 9 instead.
+exec 9<&0
+
+echo '{"op":10,"d":{"heartbeat_interval":1000}}'
+
+(
+  while IFS= read -r -u 9 line; do
+    echo "STUB got: $line" >> "$STUB_LOG"
+  done
+) &
+READER_PID=$!
+
+sleep 0.3
+echo '{"op":0,"s":1,"t":"READY","d":{"user":{"username":"testbot"}}}'
+
+sleep 0.3
+# Matches DISCORD_CHANNEL_ID in run_bot_test.sh -- should be kept.
+echo '{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"555","channel_id":"123456789","content":"hello from gateway","timestamp":"2026-07-10T12:34:56.000000+00:00","author":{"id":"999","username":"livegatewayuser","avatar":null,"bot":false},"member":{"nick":null},"attachments":[]}}'
+
+sleep 0.3
+# A different channel the bot can also see -- should be filtered out.
+echo '{"op":0,"s":3,"t":"MESSAGE_CREATE","d":{"id":"556","channel_id":"999999999","content":"off-topic channel, should be filtered","timestamp":"2026-07-10T12:34:57.000000+00:00","author":{"id":"1000","username":"otherchanneluser","avatar":null,"bot":false},"member":{"nick":null},"attachments":[]}}'
+
+sleep 0.3
+# Back to our channel, with a nick + avatar + attachment, to also cover
+# those code paths -- should be kept.
+echo '{"op":0,"s":4,"t":"MESSAGE_CREATE","d":{"id":"557","channel_id":"123456789","content":"multi\nline\ncontent","timestamp":"2026-07-10T12:34:58.000000+00:00","author":{"id":"1000","username":"secondgatewayuser","avatar":"abc123","bot":false},"member":{"nick":"Nicky"},"attachments":[{"url":"https://cdn.example/x.png","filename":"x.png","content_type":"image/png"}]}}'
+
+sleep 0.3
+# An edit of message 555 -- should update, not create, and NOT advance last_id.
+echo '{"op":0,"s":5,"t":"MESSAGE_UPDATE","d":{"id":"555","channel_id":"123456789","content":"hello from gateway (edited!)","timestamp":"2026-07-10T12:34:56.000000+00:00","edited_timestamp":"2026-07-10T12:35:10.000000+00:00","author":{"id":"999","username":"livegatewayuser","avatar":null,"bot":false},"member":{"nick":null},"attachments":[]}}'
+
+sleep 0.3
+# A partial MESSAGE_UPDATE (e.g. embed-only, no content field) -- should be skipped.
+echo '{"op":0,"s":6,"t":"MESSAGE_UPDATE","d":{"id":"555","channel_id":"123456789","content":null,"timestamp":"2026-07-10T12:34:56.000000+00:00","author":{"id":"999","username":"livegatewayuser","avatar":null,"bot":false},"member":{"nick":null},"attachments":[]}}'
+
+sleep 0.3
+# A delete of message 557, in our channel -- should emit a delete record.
+echo '{"op":0,"s":7,"t":"MESSAGE_DELETE","d":{"id":"557","channel_id":"123456789","guild_id":"1"}}'
+
+sleep 0.3
+# A delete in a different channel -- should be filtered out.
+echo '{"op":0,"s":8,"t":"MESSAGE_DELETE","d":{"id":"999","channel_id":"999999999","guild_id":"1"}}'
+
+sleep 0.3
+# Discord requesting an out-of-band heartbeat -- should get an immediate
+# op:1 reply, not just the timer-driven one.
+echo '{"op":1}'
+
+# Give the 1s heartbeat time to fire at least once before we close the pipe.
+sleep 3
+
+kill "$READER_PID" 2>/dev/null

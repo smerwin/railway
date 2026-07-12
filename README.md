@@ -136,6 +136,21 @@ You need:
 Then open `http://localhost:3000` and post a message — it should appear
 in well under a second.
 
+## Testing
+
+```bash
+test/run_bot_test.sh
+```
+
+Runs `bin/bot.sh` against `test/fake_websocat`, a stand-in for the real
+`websocat` binary that scripts a Discord Gateway handshake (Hello,
+Identify, heartbeats, `MESSAGE_CREATE`/`UPDATE`/`DELETE`, a
+server-requested out-of-band heartbeat) without a real token or network
+access. Asserts on the resulting `messages.jsonl`/`last_id` — channel
+filtering, multi-line content, edit/delete handling, the partial-update
+skip, and heartbeat delivery — in an isolated temp `DATA_DIR`. Exits
+non-zero on any failed assertion, so it's CI-safe.
+
 ## Deploying on Railway
 
 This needs a real OS with `bash`/`curl`/`jq`/`socat`/`websocat`

@@ -27,34 +27,22 @@ GATEWAY_URL="wss://gateway.discord.gg/?v=10&encoding=json"
 INTENTS=33281
 SEQ_FILE="$DATA_DIR/gateway_seq"
 
+# Tunables gathered here so a reader sees every timeout/limit in one
+# place instead of finding them scattered as bare numbers.
+REST_TIMEOUT_SECS=10       # curl --max-time for the REST catch-up call
+CATCHUP_BACKFILL_LIMIT=50  # messages to fetch on the very first run (after=0)
+CATCHUP_GAP_LIMIT=100      # messages to fetch when bridging a reconnect gap
+HELLO_TIMEOUT_SECS=10      # max wait for Discord's Hello before giving up
+
 touch "$MESSAGES_FILE"
 [ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
 
-# jq function mapping one raw Discord message object to the shape the
-# front-end expects. Shared (as inlined text) between the REST catch-up
-# path and the live Gateway dispatch path below. Takes the record "kind"
-# (create/update) as a parameter so the front-end can tell an edit from a
-# brand-new message without a separate schema.
-read -r -d '' TO_FEED_MESSAGE_DEF <<'JQ'
-def to_feed_message(kind):
-  {
-    kind: kind,
-    id: .id,
-    authorId: .author.id,
-    authorName: (.member.nick // .author.global_name // .author.username // "Unknown"),
-    authorAvatarURL: (
-      if .author.avatar then
-        "https://cdn.discordapp.com/avatars/\(.author.id)/\(.author.avatar).png?size=64"
-      else
-        "https://cdn.discordapp.com/embed/avatars/0.png"
-      end
-    ),
-    content: .content,
-    createdAt: .timestamp,
-    editedAt: (.edited_timestamp // null),
-    attachments: [.attachments[] | {url: .url, name: .filename, contentType: .content_type}]
-  };
-JQ
+# Maps raw Discord message object(s) to feed-shaped JSON; see the file
+# itself for its --arg/--mode contract. Kept as its own .jq file (invoked
+# with `jq -f`) rather than a bash string holding jq source, so bash
+# quoting and jq quoting never have to mix on the same line -- and so it
+# can be run and tested on its own, independent of bot.sh.
+TO_FEED_MESSAGE_JQ="$LIB_DIR/to_feed_message.jq"
 
 # Fetches anything posted after the last message ID we've persisted.
 # Doubles as the initial history backfill on first-ever start (after=0)
@@ -63,12 +51,17 @@ catch_up() {
   local after url response count
   after="$(cat "$STATE_FILE")"
   if [ "$after" = "0" ]; then
-    url="${API}?limit=50"
+    url="${API}?limit=${CATCHUP_BACKFILL_LIMIT}"
   else
-    url="${API}?after=${after}&limit=100"
+    url="${API}?after=${after}&limit=${CATCHUP_GAP_LIMIT}"
   fi
 
-  response="$(curl -sS --http1.1 --max-time 10 -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
+  # Any failure here just means catch_up contributes nothing this cycle
+  # -- there's no error path to recover into, so we return quietly and
+  # let the Gateway connection (or the next reconnect's catch_up) carry
+  # on. bot.sh itself exiting is also fine: run.sh's supervisor restarts
+  # it automatically.
+  response="$(curl -sS --http1.1 --max-time "$REST_TIMEOUT_SECS" -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
   [ -z "$response" ] && return 0
 
   if ! echo "$response" | jq -e 'type == "array"' >/dev/null 2>&1; then
@@ -78,10 +71,7 @@ catch_up() {
 
   count="$(echo "$response" | jq 'length')"
   if [ "$count" != "0" ]; then
-    echo "$response" | jq -c "
-      ${TO_FEED_MESSAGE_DEF}
-      reverse | .[] | select(.author.bot != true) | to_feed_message(\"create\")
-    " >> "$MESSAGES_FILE"
+    echo "$response" | jq -c -f "$TO_FEED_MESSAGE_JQ" --arg kind create --arg mode list >> "$MESSAGES_FILE"
     after="$(echo "$response" | jq -r '.[0].id')"
     echo "$after" > "$STATE_FILE"
   fi
@@ -113,8 +103,8 @@ trap cleanup EXIT
 # Discord sends a WebSocket close frame with no Hello -- trusting its
 # own shutdown timing turned "reconnect every few seconds" into
 # "reconnect every couple of minutes."
-if ! IFS= read -r -t 10 -u "${GW[0]}" hello_line; then
-  echo "bot: no Hello received from Gateway within 10s, exiting" >&2
+if ! IFS= read -r -t "$HELLO_TIMEOUT_SECS" -u "${GW[0]}" hello_line; then
+  echo "bot: no Hello received from Gateway within ${HELLO_TIMEOUT_SECS}s, exiting" >&2
   exit 1
 fi
 interval_ms="$(echo "$hello_line" | jq -r '.d.heartbeat_interval')"
@@ -144,6 +134,10 @@ send_heartbeat() {
 (
   while true; do
     sleep "$interval_sec"
+    # A failed write here just means the coproc pipe is already gone
+    # (Discord closed the connection): stop this loop quietly and let
+    # the main dispatch loop below notice the same thing on its own next
+    # read, exit bot.sh, and have run.sh's supervisor restart it.
     { send_heartbeat; } 2>/dev/null || exit 0
   done
 ) &
@@ -152,11 +146,20 @@ HEARTBEAT_PID=$!
 # Intents subscribe to every channel in every guild the bot can see, not
 # just ours -- Discord has no per-channel Gateway subscription, so both
 # handlers below filter by channel themselves before doing anything else.
+dispatch_channel_id() {
+  echo "$1" | jq -r '.d.channel_id'
+}
+
+# Returns 1 (and does nothing else) when the dispatch is for a channel
+# other than the one we're streaming. Callers use it as an early return:
+#   is_our_channel "$line" || return 0
+is_our_channel() {
+  [ "$(dispatch_channel_id "$1")" = "$DISCORD_CHANNEL_ID" ]
+}
+
 handle_message_upsert() {
   local line="$1" t="$2"
-  local channel_id
-  channel_id="$(echo "$line" | jq -r '.d.channel_id')"
-  [ "$channel_id" = "$DISCORD_CHANNEL_ID" ] || return 0
+  is_our_channel "$line" || return 0
 
   local msg_id is_bot has_content kind
   msg_id="$(echo "$line" | jq -r '.d.id')"
@@ -169,7 +172,7 @@ handle_message_upsert() {
   if [ "$is_bot" != "true" ] && [ "$has_content" = "true" ]; then
     kind="create"
     [ "$t" = "MESSAGE_UPDATE" ] && kind="update"
-    echo "$line" | jq -c --arg kind "$kind" "${TO_FEED_MESSAGE_DEF} .d | to_feed_message(\$kind)" >> "$MESSAGES_FILE"
+    echo "$line" | jq -c -f "$TO_FEED_MESSAGE_JQ" --arg kind "$kind" --arg mode frame >> "$MESSAGES_FILE"
   fi
 
   # Edits reuse the original message's ID, which is always <= the newest
@@ -183,9 +186,7 @@ handle_message_upsert() {
 # there's nothing to filter by author/content, only by channel.
 handle_message_delete() {
   local line="$1"
-  local channel_id
-  channel_id="$(echo "$line" | jq -r '.d.channel_id')"
-  [ "$channel_id" = "$DISCORD_CHANNEL_ID" ] || return 0
+  is_our_channel "$line" || return 0
 
   echo "$line" | jq -c '{kind: "delete", id: .d.id}' >> "$MESSAGES_FILE"
 }
