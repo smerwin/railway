@@ -7,6 +7,9 @@
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/config.sh"
 
+REPLAY_LINES=50       # messages replayed to a client on every /events (re)connect
+IDLE_TIMEOUT_SECS=15  # how often a heartbeat comment is sent on an otherwise-quiet stream
+
 # Make sure any child process (the `tail -F` behind /events) dies with us.
 trap 'pkill -P $$ 2>/dev/null' EXIT
 
@@ -51,11 +54,12 @@ serve_events() {
   printf 'X-Accel-Buffering: no\r\n'
   printf '\r\n'
 
-  # Replay the last 50 messages, then follow the file as the poller
-  # appends to it. `read -t` doubles as a ~15s heartbeat so intermediary
-  # proxies don't time out an idle connection.
+  # Replay the last $REPLAY_LINES messages, then follow the file as the
+  # bot appends to it. `read -t` doubles as a heartbeat every
+  # $IDLE_TIMEOUT_SECS so intermediary proxies don't time out an idle
+  # connection.
   while true; do
-    IFS= read -r -t 15 line
+    IFS= read -r -t "$IDLE_TIMEOUT_SECS" line
     status=$?
     if [ "$status" -eq 0 ]; then
       printf 'data: %s\n\n' "$line"
@@ -64,7 +68,7 @@ serve_events() {
     else
       break
     fi
-  done < <(tail -n 50 -F "$MESSAGES_FILE" 2>/dev/null)
+  done < <(tail -n "$REPLAY_LINES" -F "$MESSAGES_FILE" 2>/dev/null)
 }
 
 if [ "$method" != "GET" ]; then
