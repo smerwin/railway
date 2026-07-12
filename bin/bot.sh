@@ -12,12 +12,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/config.sh"
 : "${DISCORD_BOT_TOKEN:?Set DISCORD_BOT_TOKEN}"
 : "${DISCORD_CHANNEL_ID:?Set DISCORD_CHANNEL_ID}"
 
-# Defensive: strip any leading/trailing whitespace picked up from however
-# the variable was set (e.g. a trailing newline pasted into a dashboard).
-# REST calls embed the token in an HTTP header, which servers commonly
-# trim -- but the Gateway Identify embeds it as a raw JSON string value,
-# compared byte-for-byte, where stray whitespace would silently break
-# authentication while REST calls using the same variable kept working.
+# Strip stray whitespace (e.g. a pasted trailing newline): REST tolerates
+# it in headers, but the Gateway Identify compares it byte-for-byte as a
+# raw JSON string -- see README postmortem.
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN#"${DISCORD_BOT_TOKEN%%[![:space:]]*}"}"
 DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN%"${DISCORD_BOT_TOKEN##*[![:space:]]}"}"
 
@@ -38,10 +35,7 @@ touch "$MESSAGES_FILE"
 [ -f "$STATE_FILE" ] || echo "0" > "$STATE_FILE"
 
 # Maps raw Discord message object(s) to feed-shaped JSON; see the file
-# itself for its --arg/--mode contract. Kept as its own .jq file (invoked
-# with `jq -f`) rather than a bash string holding jq source, so bash
-# quoting and jq quoting never have to mix on the same line -- and so it
-# can be run and tested on its own, independent of bot.sh.
+# itself for its --arg/--mode contract.
 TO_FEED_MESSAGE_JQ="$LIB_DIR/to_feed_message.jq"
 
 # Shorthand for the "pipe one JSON value through a jq filter" pattern that
@@ -62,11 +56,8 @@ catch_up() {
     url="${API}?after=${after}&limit=${CATCHUP_GAP_LIMIT}"
   fi
 
-  # Any failure here just means catch_up contributes nothing this cycle
-  # -- there's no error path to recover into, so we return quietly and
-  # let the Gateway connection (or the next reconnect's catch_up) carry
-  # on. bot.sh itself exiting is also fine: run.sh's supervisor restarts
-  # it automatically.
+  # Any failure here just means catch_up contributes nothing this cycle;
+  # the Gateway connection (or the next reconnect's catch_up) carries on.
   response="$(curl -sS --http1.1 --max-time "$REST_TIMEOUT_SECS" -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" "$url")"
   [ -z "$response" ] && return 0
 
@@ -100,15 +91,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Waiting for Hello should be near-instant under normal operation --
-# unlike the main dispatch loop below, where long gaps between reads are
-# normal on a quiet channel, so a timeout here can't false-positive on
-# "healthy but idle." Enforced with our own timeout (rather than just
-# waiting for websocat's stdout to hit EOF) because websocat has been
-# observed taking upwards of a minute to actually close its pipe after
-# Discord sends a WebSocket close frame with no Hello -- trusting its
-# own shutdown timing turned "reconnect every few seconds" into
-# "reconnect every couple of minutes."
+# Hello should be near-instant, unlike the main dispatch loop below where
+# quiet gaps are normal -- so a short timeout here is safe. Enforced
+# ourselves rather than waiting on websocat's own EOF, which has been
+# observed taking upwards of a minute after a close frame with no Hello.
 if ! IFS= read -r -t "$HELLO_TIMEOUT_SECS" -u "${GW[0]}" hello_line; then
   echo "bot: no Hello received from Gateway within ${HELLO_TIMEOUT_SECS}s, exiting" >&2
   exit 1
@@ -121,15 +107,13 @@ identify="$(jq -nc --arg token "$DISCORD_BOT_TOKEN" --argjson intents "$INTENTS"
 ')"
 printf '%s\n' "$identify" >&"${GW[1]}"
 
-# Bash closes a coprocess's file descriptors in forked child processes
-# (a documented bash limitation, not something specific to this script),
-# so ${GW[1]} itself is unusable from a backgrounded job -- it has to be
-# explicitly duplicated to a fixed fd *before* backgrounding anything.
+# Bash closes a coprocess's fds in forked children, so ${GW[1]} is
+# unusable from a background job -- duplicate it to a fixed fd first.
 exec 70>&"${GW[1]}"
 
-# stderr suppressed on the whole function (rather than at each call site):
-# a failed write here just means the coproc pipe is already gone (Discord
-# closed the connection). Both call sites below rely on this to fail quietly.
+# stderr suppressed: a failed write just means the coproc pipe is gone
+# (Discord closed the connection), and both callers below treat that as
+# "stop quietly," not an error.
 send_heartbeat() {
   local seq
   seq="$(cat "$SEQ_FILE")"
@@ -143,18 +127,13 @@ send_heartbeat() {
 (
   while true; do
     sleep "$interval_sec"
-    # A failed write here means the coproc pipe is already gone (Discord
-    # closed the connection): stop this loop quietly and let the main
-    # dispatch loop below notice the same thing on its own next read,
-    # exit bot.sh, and have run.sh's supervisor restart it.
     send_heartbeat || exit 0
   done
 ) &
 HEARTBEAT_PID=$!
 
-# Intents subscribe to every channel in every guild the bot can see, not
-# just ours -- Discord has no per-channel Gateway subscription, so both
-# handlers below filter by channel themselves before doing anything else.
+# No per-channel Gateway subscription exists, so every handler below
+# filters by channel itself -- see README "tricky parts".
 dispatch_channel_id() {
   jval "$1" '.d.channel_id'
 }
