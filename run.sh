@@ -15,13 +15,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     start_ts=$(date +%s)
     "$SCRIPT_DIR/bin/bot.sh"
     elapsed=$(( $(date +%s) - start_ts ))
-    # A run that lasted a while counts as "it was working" -- reset the
-    # backoff instead of creeping it up over one-off blips. A run that
-    # died fast (the failure mode that matters here: Discord's Gateway
-    # closing the connection immediately after the WS handshake, on
-    # every attempt) grows the delay instead of hammering the same
-    # endpoint every few seconds indefinitely, which risks *causing* or
-    # prolonging a rate-limit/soft-block rather than recovering from one.
+    # A run that lasted a while was working -- reset the backoff. One
+    # that died fast grows it instead, so a persistent failure backs off
+    # rather than hammering Discord's Gateway every few seconds.
     if [ "$elapsed" -ge 30 ]; then
       backoff=3
     else

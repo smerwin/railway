@@ -106,17 +106,12 @@
 
   showEmptyState();
 
-  // Every (re)connection to /events replays the last 50 messages from
-  // scratch -- that's what lets a freshly-opened tab see recent history,
-  // but it also means EventSource's automatic reconnection (after any
-  // dropped connection: proxy idle timeouts, network blips, deploys)
-  // replays that same backlog again. Track every message ID we've
-  // rendered so a reconnect's replay never renders a "create" twice.
+  // /events replays the last 50 messages on every (re)connect, including
+  // EventSource's automatic ones -- track rendered IDs so a reconnect
+  // never renders the same "create" twice.
   const renderedIds = new Set();
 
-  // EventSource (Server-Sent Events) handles reconnection natively, so
-  // there's no manual backoff/retry logic here -- the browser re-opens
-  // the connection on its own after a drop.
+  // EventSource reconnects on its own; no manual retry logic needed.
   function connect() {
     setStatus('connecting', 'Connecting…');
     const source = new EventSource('/events');
@@ -127,22 +122,17 @@
       const msg = JSON.parse(event.data);
 
       if (msg.kind === 'delete') {
-        // Deliberately not removing msg.id from renderedIds: if this
-        // delete is later replayed after an SSE reconnect (along with
-        // the original create, both inside the last-50 window), leaving
-        // the ID marked "seen" means the replayed create is skipped
-        // entirely instead of flashing back in right before the
-        // replayed delete removes it again.
+        // Not removing msg.id from renderedIds: if a replay resends the
+        // original create after this, it should be skipped, not flash
+        // back in right before being deleted again.
         removeMessage(msg.id);
         return;
       }
 
       if (msg.kind === 'update') {
-        // Re-applying an edit that was already applied (e.g. replayed
-        // after an SSE reconnect) is harmless and idempotent. If the
-        // original message isn't currently rendered at all (edit of
-        // something outside the last-50 replay window), fall back to
-        // showing it as a new entry -- better than dropping it silently.
+        // Re-applying an already-applied edit is harmless. If the
+        // original isn't rendered (outside the last-50 window), fall
+        // back to showing the edit as a new entry rather than dropping it.
         if (updateMessage(msg)) return;
       } else if (renderedIds.has(msg.id)) {
         return;

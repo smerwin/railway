@@ -55,10 +55,7 @@ serve_events() {
   printf 'X-Accel-Buffering: no\r\n'
   printf '\r\n'
 
-  # Replay the last $REPLAY_LINES messages, then follow the file as the
-  # bot appends to it. `read -t` doubles as a heartbeat every
-  # $IDLE_TIMEOUT_SECS so intermediary proxies don't time out an idle
-  # connection.
+  # `read -t` doubles as a heartbeat so idle proxies don't time out.
   while true; do
     IFS= read -r -t "$IDLE_TIMEOUT_SECS" line
     status=$?
