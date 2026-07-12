@@ -30,7 +30,7 @@ the shared state is a JSON-lines file on disk, tailed like a log. The
 
 ## How it works
 
-Two shell scripts, one container:
+Three shell scripts, one container:
 
 1. **Bot** ([`bin/bot.sh`](bin/bot.sh)) connects to Discord's Gateway via
    `websocat` run as a bash `coproc` (a background process bash can both
@@ -51,6 +51,11 @@ Two shell scripts, one container:
    from `public/`, or opens an [SSE](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
    stream at `/events`: replay the last 50 lines of `messages.jsonl`,
    then `tail` the file forever, turning each new line into an SSE event.
+3. **Log rotation** ([`bin/rotate_logs.sh`](bin/rotate_logs.sh), also via
+   `run.sh`) — a background loop that keeps `messages.jsonl` from growing
+   forever, without disrupting the `tail -F` clients in flight from step
+   2. See [Log rotation](#log-rotation) below for the mechanism and why
+   it's built the way it is.
 
 The front-end (`public/client.js`) opens `new EventSource('/events')` and
 renders every event it receives — history and live messages arrive
@@ -61,8 +66,9 @@ browser.
 
 ```
 Discord Gateway (wss) <==coproc==> websocat <--stdin/stdout--> bot.sh --append--> messages.jsonl <--tail-- handle_request.sh --SSE--> browser (EventSource)
-                                                                  ^
-                                                    REST catch-up (on start/reconnect)
+                                                                  ^                        ^
+                                                    REST catch-up (on start/reconnect)      |
+                                                                              rotate_logs.sh (copytruncate, by size)
 ```
 
 If the bot process dies (socket drop, Discord requesting a reconnect, an
@@ -89,15 +95,57 @@ debugging time:
   `.d.channel_id` before appending anything. Easy to miss, since it
   fails quietly by leaking other channels into the feed instead of
   erroring.
-- **`tail -F` and file rotation don't mix with SSE.** An earlier version
-  trimmed `messages.jsonl` with `tail -n N | mv`, and the rename made
-  `tail -F` in `handle_request.sh` treat it as a new file, replaying the
-  trimmed contents to already-connected clients as if they were new
-  messages. `messages.jsonl` has to stay append-only.
+- **`tail -F` and file rotation don't mix with SSE, unless the rotation
+  never replaces the file.** An earlier version trimmed `messages.jsonl`
+  with `tail -n N | mv`, and the rename made `tail -F` in
+  `handle_request.sh` treat it as a new file, replaying the trimmed
+  contents to already-connected clients as if they were new messages.
+  `messages.jsonl` itself has to stay append-only; log rotation (below)
+  works around this by truncating it in place instead of replacing it.
 - **`EventSource` reconnecting looks identical, server-side, to a new
   tab opening.** Both hit `/events` fresh and get the same "replay last
   50, then follow" response. The server has no notion of what a given
   client has already seen, so `client.js` dedupes by message ID instead.
+
+## Log rotation
+
+[`bin/rotate_logs.sh`](bin/rotate_logs.sh) runs alongside the bot and web
+server. Every `LOG_ROTATE_INTERVAL_SEC` (default 60s) it checks
+`messages.jsonl`'s size, and once it crosses `LOG_ROTATE_MAX_BYTES`
+(default 5MiB) it copies the file to `messages.jsonl.<UTC timestamp>`,
+then truncates `messages.jsonl` to empty *in place* — same path, same
+inode — keeping the newest `LOG_ROTATE_KEEP` (default 5) archives and
+deleting older ones. All three are optional env vars with the defaults
+above.
+
+This is copytruncate, not the more obvious rename-and-recreate. Two other
+designs were tried and rejected first, both instructive:
+
+- Trimming with `tail -n N | mv` (an actual earlier version of this app)
+  replaces the file with a new, non-empty one at the same path. `tail -F`
+  in `handle_request.sh` reads that as a brand-new file and replays its
+  contents to already-connected SSE clients as if they were new messages
+  — the duplicate-message bug in "The tricky parts" above.
+- Renaming the file away with nothing replacing it (tried while building
+  this script) avoids that replay, but fails the same way from the other
+  direction: `tail -F`, on noticing its watched path got replaced,
+  reopens and resumes from the new file's *current* size rather than
+  from its start. Any lines written to the recreated file before `tail`
+  got around to reopening it were silently dropped from the live stream
+  — verified by testing (against the real Debian/GNU-coreutils runtime
+  this app deploys on, not macOS's BSD `tail`) to lose whole batches of
+  messages under realistic write timing, not just a rare edge case.
+
+Truncating in place sidesteps both: `tail -F` never reopens anything, so
+its ordinary truncation handling ("the file got smaller, keep reading
+forward from the new size") is what fires, with no reconnect-like reset.
+The one remaining trade-off — standard for copytruncate, e.g. what
+nginx/rsyslog default to — is a narrow race: a line written in the gap
+between the copy finishing and the truncate landing can be skipped by
+whichever SSE clients are attached at that instant. Verified by testing
+(realistic, spaced write timing across a rotation) to cost at most the
+single message straddling that instant, never a batch, and it's
+preserved in the archive on disk either way.
 
 ## Running locally
 
@@ -251,43 +299,14 @@ at all.
   reconnects automatically on any dropped connection, so that replay can
   happen mid-session too. `client.js` dedupes by message ID to avoid
   rendering the backlog twice.
-- **Log rotation, by size, using copytruncate.** [`bin/rotate_logs.sh`](bin/rotate_logs.sh)
-  runs alongside the bot and web server. Every `LOG_ROTATE_INTERVAL_SEC`
-  (default 60s) it checks `messages.jsonl`'s size, and once it crosses
-  `LOG_ROTATE_MAX_BYTES` (default 5MiB) it copies the file to
-  `messages.jsonl.<UTC timestamp>`, then truncates `messages.jsonl` to
-  empty *in place* — same path, same inode — keeping the newest
-  `LOG_ROTATE_KEEP` (default 5) archives and deleting older ones. Two
-  designs were tried and rejected before this one, both instructive:
-    - Trimming with `tail -n N | mv` (an actual earlier version) replaces
-      the file with a new, non-empty one at the same path. `tail -F` in
-      `handle_request.sh` reads that as a brand-new file and replays its
-      contents to already-connected SSE clients as if they were new
-      messages — the duplicate-message bug described above.
-    - Renaming the file away with nothing replacing it (tried while
-      building this script) avoids that replay, but has the same failure
-      class from the other direction: `tail -F`, on noticing its watched
-      path got replaced, reopens and resumes from the new file's
-      *current* size rather than from its start. Any lines written to the
-      recreated file before tail got around to reopening it were silently
-      dropped from the live stream — verified by testing to lose whole
-      batches of messages under realistic write timing, not a rare edge
-      case.
-
-  Truncating in place sidesteps both: `tail -F` never reopens anything, so
-  its ordinary truncation handling ("the file got smaller, keep reading
-  forward from the new size") is what fires, with no reconnect-like reset.
-  The one remaining trade-off — standard for copytruncate, e.g. what
-  nginx/rsyslog default to — is a narrow race: a line written in the gap
-  between the copy finishing and the truncate landing can be skipped by
-  whichever SSE clients are attached at that instant. Verified by testing
-  (realistic, spaced write timing across a rotation) to cost at most the
-  single message straddling that instant, never a batch, and it's
-  preserved in the archive on disk either way.
 - **No persistence across restarts/redeploys.** `data/` is plain
   container-local disk. A redeploy or crash loses history (the bot
   resumes live-streaming via REST catch-up, so it won't re-flood
   messages, but old history is gone) unless a Railway volume is attached.
+  This applies equally to rotated archives (`messages.jsonl.<timestamp>`,
+  see [Log rotation](#log-rotation)) — they're on the same disk, and
+  aren't gzipped either, since the image has no `gzip` (deliberately, to
+  avoid adding a dependency for a nice-to-have).
 - **Single instance only.** One bot process, one shared file. Multiple
   Railway replicas would mean multiple competing Gateway connections
   each duplicating messages into their own local file.
